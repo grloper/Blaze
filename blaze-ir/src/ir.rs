@@ -67,18 +67,58 @@ impl Default for Signature {
     }
 }
 
-/// A single SSA operation. Registers are dense `u32` value numbers, unique
-/// within a [`FunctionNode`]; each op defines at most one.
+/// An integer comparison, producing `1` (true) or `0` (false).
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
+pub enum CmpKind {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+    Ne,
+}
+
+/// A single DevIR operation over dense `u32` virtual registers.
+///
+/// Registers are *mutable* virtual registers, not strict SSA values: parameters
+/// occupy `0..arity`, each named local owns one dedicated register (so `Copy`
+/// implements assignment across control-flow joins), and expression temporaries
+/// are freshly numbered. The JIT backend maps registers onto
+/// `cranelift-frontend` variables, which reconstructs SSA form (including phis)
+/// mechanically.
+///
+/// Control flow is label-structured: [`IrOp::Label`] opens a basic block and
+/// lowering guarantees every block is closed by exactly one `Jump`, `Branch`,
+/// or `Return` before the next `Label` (or end of body). Backends may rely on
+/// that invariant.
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub enum IrOp {
     /// `dst = <imm>`
     LoadInt(u32, i64),
     /// `dst = lhs + rhs`
     Add(u32, u32, u32),
+    /// `dst = lhs - rhs`
+    Sub(u32, u32, u32),
+    /// `dst = lhs * rhs`
+    Mul(u32, u32, u32),
+    /// `dst = lhs / rhs` — **guarded**: `x / 0 == 0` and `INT_MIN / -1 ==
+    /// INT_MIN`, so no live-edited program can fault the host process on a
+    /// division. The backend emits the guards.
+    Div(u32, u32, u32),
+    /// `dst = (lhs <op> rhs) ? 1 : 0`
+    Cmp(CmpKind, u32, u32, u32),
+    /// `dst = src` (assignment into a variable's dedicated register)
+    Copy(u32, u32),
     /// `dst = callee(args...)`
     Call(u32, FunctionId, Vec<u32>),
     /// `return value`
     Return(u32),
+    /// Unconditional jump to a label.
+    Jump(u32),
+    /// `if cond != 0 goto then_label else goto else_label`
+    Branch(u32, u32, u32),
+    /// Opens the basic block named by this label id.
+    Label(u32),
 }
 
 /// The lowered form of one source function: its ABI, its SSA body, and the set
@@ -100,45 +140,81 @@ impl FunctionNode {
         FunctionNode { id, signature: Signature::default(), body: Vec::new(), dependencies: Vec::new() }
     }
 
-    /// The number of distinct SSA registers the body defines or references.
+    /// The number of distinct virtual registers the body defines or references.
     pub fn register_count(&self) -> usize {
         let mut max = None::<u32>;
         let mut note = |r: u32| max = Some(max.map_or(r, |m| m.max(r)));
         for op in &self.body {
             match op {
                 IrOp::LoadInt(d, _) => note(*d),
-                IrOp::Add(d, a, b) => {
+                IrOp::Add(d, a, b)
+                | IrOp::Sub(d, a, b)
+                | IrOp::Mul(d, a, b)
+                | IrOp::Div(d, a, b)
+                | IrOp::Cmp(_, d, a, b) => {
                     note(*d);
                     note(*a);
                     note(*b);
+                }
+                IrOp::Copy(d, s) => {
+                    note(*d);
+                    note(*s);
                 }
                 IrOp::Call(d, _, args) => {
                     note(*d);
                     args.iter().for_each(|a| note(*a));
                 }
                 IrOp::Return(v) => note(*v),
+                IrOp::Branch(c, _, _) => note(*c),
+                IrOp::Jump(_) | IrOp::Label(_) => {}
+            }
+        }
+        max.map_or(0, |m| m as usize + 1)
+    }
+
+    /// The number of labels (basic-block openers) in the body.
+    pub fn label_count(&self) -> usize {
+        let mut max = None::<u32>;
+        let mut note = |l: u32| max = Some(max.map_or(l, |m: u32| m.max(l)));
+        for op in &self.body {
+            match op {
+                IrOp::Label(l) | IrOp::Jump(l) => note(*l),
+                IrOp::Branch(_, t, e) => {
+                    note(*t);
+                    note(*e);
+                }
+                _ => {}
             }
         }
         max.map_or(0, |m| m as usize + 1)
     }
 }
 
-/// Accumulates SSA operations while lowering an AST body. Kept in this module so
-/// the register-allocation discipline lives next to the IR it produces.
+/// Accumulates DevIR operations while lowering an AST body. Kept in this module
+/// so the register-allocation discipline lives next to the IR it produces.
 #[derive(Debug, Default)]
 pub struct IrBuilder {
     next_reg: u32,
+    next_label: u32,
     ops: Vec<IrOp>,
     deps: BTreeSet<FunctionId>,
 }
 
 impl IrBuilder {
-    /// Allocate a fresh, never-before-used SSA register.
+    /// Allocate a fresh, never-before-used virtual register.
     #[inline]
     pub fn fresh(&mut self) -> u32 {
         let r = self.next_reg;
         self.next_reg += 1;
         r
+    }
+
+    /// Allocate a fresh label. Bind it later with [`Self::bind_label`].
+    #[inline]
+    pub fn fresh_label(&mut self) -> u32 {
+        let l = self.next_label;
+        self.next_label += 1;
+        l
     }
 
     pub fn load_int(&mut self, value: i64) -> u32 {
@@ -153,6 +229,35 @@ impl IrBuilder {
         dst
     }
 
+    pub fn sub(&mut self, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.fresh();
+        self.ops.push(IrOp::Sub(dst, lhs, rhs));
+        dst
+    }
+
+    pub fn mul(&mut self, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.fresh();
+        self.ops.push(IrOp::Mul(dst, lhs, rhs));
+        dst
+    }
+
+    pub fn div(&mut self, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.fresh();
+        self.ops.push(IrOp::Div(dst, lhs, rhs));
+        dst
+    }
+
+    pub fn cmp(&mut self, kind: CmpKind, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.fresh();
+        self.ops.push(IrOp::Cmp(kind, dst, lhs, rhs));
+        dst
+    }
+
+    /// Assignment into an existing register (a variable's dedicated slot).
+    pub fn copy(&mut self, dst: u32, src: u32) {
+        self.ops.push(IrOp::Copy(dst, src));
+    }
+
     pub fn call(&mut self, callee: FunctionId, args: Vec<u32>) -> u32 {
         let dst = self.fresh();
         self.deps.insert(callee);
@@ -162,6 +267,19 @@ impl IrBuilder {
 
     pub fn ret(&mut self, value: u32) {
         self.ops.push(IrOp::Return(value));
+    }
+
+    pub fn jump(&mut self, label: u32) {
+        self.ops.push(IrOp::Jump(label));
+    }
+
+    pub fn branch(&mut self, cond: u32, then_label: u32, else_label: u32) {
+        self.ops.push(IrOp::Branch(cond, then_label, else_label));
+    }
+
+    /// Open the basic block named `label` at the current position.
+    pub fn bind_label(&mut self, label: u32) {
+        self.ops.push(IrOp::Label(label));
     }
 
     /// Finish building, sealing the ops and dependency set into a node.

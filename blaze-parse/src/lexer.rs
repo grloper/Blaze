@@ -25,6 +25,12 @@ enum RawToken {
     IntKw,
     #[token("return")]
     ReturnKw,
+    #[token("if")]
+    IfKw,
+    #[token("else")]
+    ElseKw,
+    #[token("while")]
+    WhileKw,
 
     // A decimal integer literal. Values are parsed later during lowering; the
     // lexer only recognizes the shape.
@@ -46,12 +52,31 @@ enum RawToken {
     Comma,
     #[token(";")]
     Semicolon,
+    // Two-character operators are declared alongside their one-character
+    // prefixes; `logos` resolves the overlap by longest match, so `<=` never
+    // lexes as `<` `=`.
+    #[token("==")]
+    EqEq,
+    #[token("!=")]
+    NotEq,
+    #[token("<=")]
+    LtEq,
+    #[token(">=")]
+    GtEq,
+    #[token("<")]
+    Lt,
+    #[token(">")]
+    Gt,
     #[token("=")]
     Eq,
     #[token("+")]
     Plus,
+    #[token("-")]
+    Minus,
     #[token("*")]
     Star,
+    #[token("/")]
+    Slash,
     #[token("&")]
     Amp,
 }
@@ -64,6 +89,9 @@ impl RawToken {
             RawToken::LineComment => SyntaxKind::LINE_COMMENT,
             RawToken::IntKw => SyntaxKind::INT_KW,
             RawToken::ReturnKw => SyntaxKind::RETURN_KW,
+            RawToken::IfKw => SyntaxKind::IF_KW,
+            RawToken::ElseKw => SyntaxKind::ELSE_KW,
+            RawToken::WhileKw => SyntaxKind::WHILE_KW,
             RawToken::IntLiteral => SyntaxKind::INT_LITERAL,
             RawToken::Ident => SyntaxKind::IDENT,
             RawToken::LParen => SyntaxKind::L_PAREN,
@@ -72,9 +100,17 @@ impl RawToken {
             RawToken::RBrace => SyntaxKind::R_BRACE,
             RawToken::Comma => SyntaxKind::COMMA,
             RawToken::Semicolon => SyntaxKind::SEMICOLON,
+            RawToken::EqEq => SyntaxKind::EQ_EQ,
+            RawToken::NotEq => SyntaxKind::NOT_EQ,
+            RawToken::LtEq => SyntaxKind::LT_EQ,
+            RawToken::GtEq => SyntaxKind::GT_EQ,
+            RawToken::Lt => SyntaxKind::LT,
+            RawToken::Gt => SyntaxKind::GT,
             RawToken::Eq => SyntaxKind::EQ,
             RawToken::Plus => SyntaxKind::PLUS,
+            RawToken::Minus => SyntaxKind::MINUS,
             RawToken::Star => SyntaxKind::STAR,
+            RawToken::Slash => SyntaxKind::SLASH,
             RawToken::Amp => SyntaxKind::AMP,
         }
     }
@@ -148,6 +184,23 @@ mod tests {
         let reconstructed: String =
             tokenize(src).iter().map(|l| l.text(src)).collect();
         assert_eq!(reconstructed, src, "concatenated lexemes must equal the source");
+    }
+
+    #[test]
+    fn two_char_operators_win_over_prefixes() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("<= >= == != < > = - /"), vec![
+            LT_EQ, WHITESPACE, GT_EQ, WHITESPACE, EQ_EQ, WHITESPACE, NOT_EQ, WHITESPACE,
+            LT, WHITESPACE, GT, WHITESPACE, EQ, WHITESPACE, MINUS, WHITESPACE, SLASH,
+        ]);
+    }
+
+    #[test]
+    fn control_flow_keywords_lex() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("if else while iffy"), vec![
+            IF_KW, WHITESPACE, ELSE_KW, WHITESPACE, WHILE_KW, WHITESPACE, IDENT,
+        ]);
     }
 
     #[test]

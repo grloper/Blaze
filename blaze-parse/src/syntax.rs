@@ -22,6 +22,9 @@ pub enum SyntaxKind {
     // ---- Keywords ----
     INT_KW,    // `int`
     RETURN_KW, // `return`
+    IF_KW,     // `if`
+    ELSE_KW,   // `else`
+    WHILE_KW,  // `while`
 
     // ---- Literals & identifiers ----
     INT_LITERAL, // `42`
@@ -36,7 +39,15 @@ pub enum SyntaxKind {
     SEMICOLON, // `;`
     EQ,        // `=`
     PLUS,      // `+`
-    STAR,      // `*`  (reserved for pointer syntax)
+    MINUS,     // `-`
+    STAR,      // `*`
+    SLASH,     // `/`
+    LT,        // `<`
+    GT,        // `>`
+    LT_EQ,     // `<=`
+    GT_EQ,     // `>=`
+    EQ_EQ,     // `==`
+    NOT_EQ,    // `!=`
     AMP,       // `&`  (reserved for address-of syntax)
 
     // ---- Sentinel ----
@@ -50,9 +61,13 @@ pub enum SyntaxKind {
     PARAM,        // `int a`
     BLOCK,        // `{ .. }`
     LET_STMT,     // `int x = expr;`
+    ASSIGN_STMT,  // `x = expr;`
     RETURN_STMT,  // `return expr;`
+    IF_STMT,      // `if (cond) { .. } else { .. }`
+    WHILE_STMT,   // `while (cond) { .. }`
     EXPR_STMT,    // `expr;`
-    BIN_EXPR,     // `a + b`
+    BIN_EXPR,     // `a + b`, `a < b`, ...
+    PREFIX_EXPR,  // `-a`
     CALL_EXPR,    // `f(a, b)`
     ARG_LIST,     // `( a, b )`
     LITERAL_EXPR, // `42`

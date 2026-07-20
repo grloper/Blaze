@@ -14,6 +14,6 @@ pub mod lexer;
 pub mod parser;
 pub mod syntax;
 
-pub use ast::{AstNode, Block, Expr, Function, SourceFile, Stmt};
+pub use ast::{AstNode, BinOp, Block, ElseArm, Expr, Function, SourceFile, Stmt};
 pub use parser::{parse, Parse, SyntaxError};
 pub use syntax::{BlazeLanguage, SyntaxKind, SyntaxNode, SyntaxToken};

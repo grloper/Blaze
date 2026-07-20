@@ -84,6 +84,69 @@ fn codegen_inherits_the_incremental_firewall() {
 }
 
 #[test]
+fn control_flow_recursion_and_arithmetic_execute_correctly() {
+    let src = "\
+int fib(int n) {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+
+int sum_odds(int n) {
+    int i = 0;
+    int acc = 0;
+    while (i < n) {
+        if (i / 2 * 2 != i) {
+            acc = acc + i;
+        }
+        i = i + 1;
+    }
+    return acc;
+}
+
+int main() {
+    return fib(10) * 1000 + sum_odds(10);
+}
+";
+    let (db, src) = setup(src);
+    let engine = jit_program(&db, src).expect("JIT compilation should succeed");
+
+    assert_eq!(engine.call("fib", &[10]), Some(55), "fib(10) via recursion + if/else");
+    assert_eq!(engine.call("sum_odds", &[10]), Some(25), "1+3+5+7+9 via while + if");
+    assert_eq!(engine.call("main", &[]), Some(55 * 1000 + 25));
+    assert_eq!(engine.call("fib", &[0]), Some(0));
+    assert_eq!(engine.call("fib", &[1]), Some(1));
+}
+
+#[test]
+fn division_is_guarded_and_cannot_fault_the_process() {
+    let src = "\
+int div(int a, int b) {
+    return a / b;
+}
+
+int neg(int x) {
+    return -x;
+}
+";
+    let (db, src) = setup(src);
+    let engine = jit_program(&db, src).expect("compile");
+
+    assert_eq!(engine.call("div", &[10, 3]), Some(3));
+    assert_eq!(engine.call("div", &[-10, 2]), Some(-5));
+    // The two hardware-fault cases are defined instead of trapping: a live
+    // edit must never be able to take down the embedding process.
+    assert_eq!(engine.call("div", &[7, 0]), Some(0), "x / 0 == 0 by definition");
+    assert_eq!(
+        engine.call("div", &[i64::MIN, -1]),
+        Some(i64::MIN),
+        "INT_MIN / -1 == INT_MIN by definition"
+    );
+    assert_eq!(engine.call("neg", &[42]), Some(-42), "unary minus");
+}
+
+#[test]
 fn hot_recompile_reflects_source_edits_in_execution() {
     let (mut db, src) = setup(V1);
 

@@ -8,28 +8,35 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{AbiParam, types, Function, UserFuncName};
+use cranelift_codegen::ir::{types, AbiParam, InstBuilder, UserFuncName};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 
 use blaze_ir::{FunctionId, FunctionNode};
 
-use crate::codegen::{build_body, host_isa, CalleeResolver};
+use crate::codegen::{build_body, host_isa, CallEmitter};
 
-/// Resolves DevIR callees against functions already declared in the module.
-struct JitResolver<'a> {
+/// Emits direct calls against functions already declared in the module.
+struct ModuleEmitter<'a> {
     module: &'a mut JITModule,
     ids: &'a HashMap<FunctionId, FuncId>,
 }
 
-impl CalleeResolver for JitResolver<'_> {
-    fn resolve(&mut self, func: &mut Function, callee: FunctionId, _arity: usize) -> cranelift_codegen::ir::FuncRef {
+impl CallEmitter for ModuleEmitter<'_> {
+    fn emit_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        callee: FunctionId,
+        args: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
         let func_id = *self
             .ids
             .get(&callee)
             .expect("every called function must be declared before definition");
-        self.module.declare_func_in_func(func_id, func)
+        let callee_ref = self.module.declare_func_in_func(func_id, builder.func);
+        let call = builder.ins().call(callee_ref, args);
+        builder.inst_results(call)[0]
     }
 }
 
@@ -89,8 +96,8 @@ impl JitEngine {
             let mut fb_ctx = FunctionBuilderContext::new();
             {
                 let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
-                let mut resolver = JitResolver { module: &mut self.module, ids: &self.ids };
-                build_body(&mut builder, node, &mut resolver);
+                let mut emitter = ModuleEmitter { module: &mut self.module, ids: &self.ids };
+                build_body(&mut builder, node, &mut emitter);
                 builder.finalize(frontend_cfg);
             }
 

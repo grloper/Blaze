@@ -17,14 +17,24 @@
 //! param_list  := '(' (param (',' param)*)? ')'
 //! param       := 'int' NAME
 //! block       := '{' stmt* '}'
-//! stmt        := let_stmt | return_stmt | expr_stmt
+//! stmt        := let_stmt | assign_stmt | return_stmt | if_stmt | while_stmt | expr_stmt
 //! let_stmt    := 'int' NAME '=' expr ';'
+//! assign_stmt := NAME '=' expr ';'
 //! return_stmt := 'return' expr ';'
+//! if_stmt     := 'if' '(' expr ')' block ('else' (if_stmt | block))?
+//! while_stmt  := 'while' '(' expr ')' block
 //! expr_stmt   := expr ';'
-//! expr        := primary ('+' primary)*            // left-associative
-//! primary     := INT_LITERAL | NAME_REF | call | '(' expr ')'
-//! call        := NAME_REF arg_list
-//! arg_list    := '(' (expr (',' expr)*)? ')'
+//!
+//! // Expressions, lowest to highest precedence (all binaries left-associative):
+//! expr     := equality
+//! equality := relation (('==' | '!=') relation)*
+//! relation := additive (('<' | '>' | '<=' | '>=') additive)*
+//! additive := multipl (('+' | '-') multipl)*
+//! multipl  := unary (('*' | '/') unary)*
+//! unary    := '-' unary | primary
+//! primary  := INT_LITERAL | NAME_REF | call | '(' expr ')'
+//! call     := NAME_REF arg_list
+//! arg_list := '(' (expr (',' expr)*)? ')'
 //! ```
 
 use rowan::{GreenNode, GreenNodeBuilder};
@@ -247,6 +257,11 @@ impl<'a> Parser<'a> {
         match self.current() {
             Some(SyntaxKind::INT_KW) => self.let_stmt(),
             Some(SyntaxKind::RETURN_KW) => self.return_stmt(),
+            Some(SyntaxKind::IF_KW) => self.if_stmt(),
+            Some(SyntaxKind::WHILE_KW) => self.while_stmt(),
+            // `x = ...;` needs one token of lookahead to distinguish an
+            // assignment from an expression statement starting with a name.
+            Some(SyntaxKind::IDENT) if self.nth(1) == Some(SyntaxKind::EQ) => self.assign_stmt(),
             Some(_) => self.expr_stmt(),
             None => {}
         }
@@ -262,11 +277,49 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
+    fn assign_stmt(&mut self) {
+        self.start(SyntaxKind::ASSIGN_STMT);
+        self.name();
+        self.expect(SyntaxKind::EQ);
+        self.expr();
+        self.expect(SyntaxKind::SEMICOLON);
+        self.finish();
+    }
+
     fn return_stmt(&mut self) {
         self.start(SyntaxKind::RETURN_STMT);
         self.expect(SyntaxKind::RETURN_KW);
         self.expr();
         self.expect(SyntaxKind::SEMICOLON);
+        self.finish();
+    }
+
+    fn if_stmt(&mut self) {
+        self.start(SyntaxKind::IF_STMT);
+        self.expect(SyntaxKind::IF_KW);
+        self.expect(SyntaxKind::L_PAREN);
+        self.expr();
+        self.expect(SyntaxKind::R_PAREN);
+        self.block();
+        if self.at(SyntaxKind::ELSE_KW) {
+            self.bump(); // `else`
+            if self.at(SyntaxKind::IF_KW) {
+                // `else if` chains as a nested IF_STMT child.
+                self.if_stmt();
+            } else {
+                self.block();
+            }
+        }
+        self.finish();
+    }
+
+    fn while_stmt(&mut self) {
+        self.start(SyntaxKind::WHILE_STMT);
+        self.expect(SyntaxKind::WHILE_KW);
+        self.expect(SyntaxKind::L_PAREN);
+        self.expr();
+        self.expect(SyntaxKind::R_PAREN);
+        self.block();
         self.finish();
     }
 
@@ -277,17 +330,44 @@ impl<'a> Parser<'a> {
         self.finish();
     }
 
-    /// `expr := primary ('+' primary)*`, folded left-associatively via a
-    /// checkpoint so `a + b + c` becomes `(a + b) + c`.
+    /// Binary operators, grouped by precedence level from loosest to tightest.
+    /// Each level folds left-associatively via a checkpoint, so `a - b - c`
+    /// becomes `(a - b) - c`.
+    const BIN_LEVELS: &'static [&'static [SyntaxKind]] = &[
+        &[SyntaxKind::EQ_EQ, SyntaxKind::NOT_EQ],
+        &[SyntaxKind::LT, SyntaxKind::GT, SyntaxKind::LT_EQ, SyntaxKind::GT_EQ],
+        &[SyntaxKind::PLUS, SyntaxKind::MINUS],
+        &[SyntaxKind::STAR, SyntaxKind::SLASH],
+    ];
+
     fn expr(&mut self) {
+        self.expr_at_level(0);
+    }
+
+    fn expr_at_level(&mut self, level: usize) {
+        let Some(ops) = Self::BIN_LEVELS.get(level) else {
+            return self.unary();
+        };
         self.flush_trivia();
         let checkpoint = self.builder.checkpoint();
-        self.primary();
-        while self.at(SyntaxKind::PLUS) {
+        self.expr_at_level(level + 1);
+        while self.current().is_some_and(|k| ops.contains(&k)) {
             self.builder.start_node_at(checkpoint, SyntaxKind::BIN_EXPR.into());
-            self.bump(); // '+'
-            self.primary();
+            self.bump(); // the operator
+            self.expr_at_level(level + 1);
             self.finish();
+        }
+    }
+
+    /// `unary := '-' unary | primary`
+    fn unary(&mut self) {
+        if self.at(SyntaxKind::MINUS) {
+            self.start(SyntaxKind::PREFIX_EXPR);
+            self.bump(); // '-'
+            self.unary();
+            self.finish();
+        } else {
+            self.primary();
         }
     }
 
@@ -359,6 +439,40 @@ mod tests {
         let src = "int main() {\n  int x = 1 + 2;\n  return add(x, 3);\n}\n";
         let parse = parse(src);
         // The red tree's text must equal the original source byte-for-byte.
+        assert_eq!(parse.syntax().text().to_string(), src);
+    }
+
+    #[test]
+    fn parses_control_flow_and_operators() {
+        let src = "\
+int abs_diff(int a, int b) {
+    int d = a - b;
+    if (d < 0) {
+        d = 0 - d;
+    }
+    return d;
+}
+
+int count(int n) {
+    int i = 0;
+    int acc = 0;
+    while (i < n) {
+        acc = acc + i * 2 / 1;
+        i = i + 1;
+    }
+    return acc;
+}
+";
+        let parse = parse(src);
+        assert!(parse.errors().is_empty(), "unexpected errors: {:?}", parse.errors());
+        assert_eq!(parse.syntax().text().to_string(), src, "must stay lossless");
+    }
+
+    #[test]
+    fn parses_else_if_chains_and_unary_minus() {
+        let src = "int f(int x) { if (x == 0) { return -1; } else if (x != 1) { return x; } else { return 0; } }";
+        let parse = parse(src);
+        assert!(parse.errors().is_empty(), "unexpected errors: {:?}", parse.errors());
         assert_eq!(parse.syntax().text().to_string(), src);
     }
 

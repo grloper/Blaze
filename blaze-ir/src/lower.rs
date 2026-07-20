@@ -27,10 +27,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use blaze_parse::ast::{CallExpr, Expr, Function, SourceFile, Stmt};
+use blaze_parse::ast::{BinOp, Block, CallExpr, ElseArm, Expr, Function, SourceFile, Stmt};
 
 use crate::db::{BlazeDatabase, FnKey, SourceProgram};
-use crate::ir::{function_id_of, FunctionNode, IrBuilder, Signature, Type};
+use crate::ir::{function_id_of, CmpKind, FunctionNode, IrBuilder, Signature, Type};
 
 /// The ordered list of top-level function names in the program.
 ///
@@ -124,39 +124,153 @@ struct Lowerer<'db> {
 impl<'db> Lowerer<'db> {
     fn lower_function(&self, func: &Function, name: &str, signature: Signature) -> FunctionNode {
         let mut builder = IrBuilder::default();
-        // Parameters occupy the first SSA registers, in declaration order.
+        // Parameters occupy the first registers, in declaration order.
         let mut env: HashMap<String, u32> = HashMap::new();
         for param in func.params() {
             let reg = builder.fresh();
             env.insert(param, reg);
         }
 
-        if let Some(block) = func.body() {
-            for stmt in block.statements() {
-                self.lower_stmt(&mut builder, &mut env, &stmt);
-            }
+        let terminated = match func.body() {
+            Some(block) => self.lower_block(&mut builder, &mut env, &block),
+            None => false,
+        };
+        // A function that falls off the end returns 0 (the C-subset has no
+        // `void`), keeping every DevIR body properly terminated.
+        if !terminated {
+            let zero = builder.load_int(0);
+            builder.ret(zero);
         }
 
         builder.finish(function_id_of(name), signature)
     }
 
-    fn lower_stmt(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, stmt: &Stmt) {
+    /// Lower every statement of `block`. Returns `true` if the block
+    /// *terminated* — every control path through it ended in `return` — in
+    /// which case any trailing statements are dead and deliberately not
+    /// emitted, so DevIR never contains unreachable blocks or unbound labels.
+    fn lower_block(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, block: &Block) -> bool {
+        for stmt in block.statements() {
+            if self.lower_stmt(b, env, &stmt) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Lower one statement; returns `true` if it terminates control flow.
+    fn lower_stmt(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, stmt: &Stmt) -> bool {
         match stmt {
             Stmt::Let(let_stmt) => {
-                let reg = self.lower_opt(b, env, let_stmt.value());
+                let value = self.lower_opt(b, env, let_stmt.value());
                 if let Some(name) = let_stmt.name() {
-                    env.insert(name, reg);
+                    // Each named local owns a dedicated register so later
+                    // assignments (possibly across control-flow joins) are
+                    // plain `Copy`s into a stable slot.
+                    let slot = b.fresh();
+                    b.copy(slot, value);
+                    env.insert(name, slot);
                 }
+                false
+            }
+            Stmt::Assign(assign) => {
+                let value = self.lower_opt(b, env, assign.value());
+                if let Some(name) = assign.name() {
+                    let slot = *env.entry(name).or_insert_with(|| b.fresh());
+                    b.copy(slot, value);
+                }
+                false
             }
             Stmt::Return(ret) => {
                 let reg = self.lower_opt(b, env, ret.value());
                 b.ret(reg);
+                true
+            }
+            Stmt::If(if_stmt) => {
+                let cond = self.lower_opt(b, env, if_stmt.condition());
+                let l_then = b.fresh_label();
+                let l_end = b.fresh_label();
+
+                match if_stmt.else_arm() {
+                    None => {
+                        // No else: the false edge falls straight through to
+                        // `l_end`, which is therefore always reachable.
+                        b.branch(cond, l_then, l_end);
+                        b.bind_label(l_then);
+                        let t = match if_stmt.then_block() {
+                            Some(then) => self.lower_block(b, env, &then),
+                            None => false,
+                        };
+                        if !t {
+                            b.jump(l_end);
+                        }
+                        b.bind_label(l_end);
+                        false
+                    }
+                    Some(else_arm) => {
+                        let l_else = b.fresh_label();
+                        b.branch(cond, l_then, l_else);
+
+                        b.bind_label(l_then);
+                        let then_terminated = match if_stmt.then_block() {
+                            Some(then) => self.lower_block(b, env, &then),
+                            None => false,
+                        };
+                        if !then_terminated {
+                            b.jump(l_end);
+                        }
+
+                        b.bind_label(l_else);
+                        let else_terminated = match else_arm {
+                            ElseArm::Block(block) => self.lower_block(b, env, &block),
+                            ElseArm::If(nested) => {
+                                self.lower_stmt(b, env, &Stmt::If(nested))
+                            }
+                        };
+                        if !else_terminated {
+                            b.jump(l_end);
+                        }
+
+                        // Bind the join point only if some path reaches it;
+                        // otherwise the whole `if` terminates and the caller
+                        // stops emitting dead code after it.
+                        let terminated = then_terminated && else_terminated;
+                        if !terminated {
+                            b.bind_label(l_end);
+                        }
+                        terminated
+                    }
+                }
+            }
+            Stmt::While(while_stmt) => {
+                let l_head = b.fresh_label();
+                let l_body = b.fresh_label();
+                let l_end = b.fresh_label();
+
+                b.jump(l_head);
+                b.bind_label(l_head);
+                let cond = self.lower_opt(b, env, while_stmt.condition());
+                b.branch(cond, l_body, l_end);
+
+                b.bind_label(l_body);
+                let body_terminated = match while_stmt.body() {
+                    Some(body) => self.lower_block(b, env, &body),
+                    None => false,
+                };
+                if !body_terminated {
+                    b.jump(l_head);
+                }
+
+                // `l_end` is always reachable via the condition's false edge.
+                b.bind_label(l_end);
+                false
             }
             Stmt::Expr(expr_stmt) => {
                 if let Some(expr) = expr_stmt.expr() {
                     // Evaluated for effects (calls); the result register is unused.
                     self.lower_expr(b, env, &expr);
                 }
+                false
             }
         }
     }
@@ -186,7 +300,24 @@ impl<'db> Lowerer<'db> {
                 let (lhs, rhs) = bin.operands();
                 let l = self.lower_opt(b, env, lhs);
                 let r = self.lower_opt(b, env, rhs);
-                b.add(l, r)
+                match bin.op() {
+                    Some(BinOp::Add) | None => b.add(l, r),
+                    Some(BinOp::Sub) => b.sub(l, r),
+                    Some(BinOp::Mul) => b.mul(l, r),
+                    Some(BinOp::Div) => b.div(l, r),
+                    Some(BinOp::Lt) => b.cmp(CmpKind::Lt, l, r),
+                    Some(BinOp::Gt) => b.cmp(CmpKind::Gt, l, r),
+                    Some(BinOp::LtEq) => b.cmp(CmpKind::Le, l, r),
+                    Some(BinOp::GtEq) => b.cmp(CmpKind::Ge, l, r),
+                    Some(BinOp::EqEq) => b.cmp(CmpKind::Eq, l, r),
+                    Some(BinOp::NotEq) => b.cmp(CmpKind::Ne, l, r),
+                }
+            }
+            Expr::Prefix(prefix) => {
+                // Unary minus lowers as `0 - operand`.
+                let zero = b.load_int(0);
+                let operand = self.lower_opt(b, env, prefix.operand());
+                b.sub(zero, operand)
             }
             Expr::Call(call) => self.lower_call(b, env, call),
             Expr::Paren(paren) => self.lower_opt(b, env, paren.inner()),
