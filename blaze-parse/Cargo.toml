@@ -1,0 +1,13 @@
+[package]
+name = "blaze-parse"
+description = "Lexer, recursive-descent parser, and lossless CST for Blaze's C-subset."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+logos.workspace = true
+rowan.workspace = true

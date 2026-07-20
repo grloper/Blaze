@@ -1,0 +1,48 @@
+# Blaze — Incremental Computation Graph Middleware
+#
+# Virtual workspace manifest. Blaze sits between high-fidelity language
+# frontends (AST diffs) and a lightweight JIT backend (Cranelift), abstracting
+# a codebase into a fine-grained incremental query graph.
+#
+#   blaze-parse  lexing (logos) + lossless CST (rowan) + recursive-descent parser
+#   blaze-ir     lowering CST -> SSA-style DevIR, wired into a salsa query database
+#   blaze-jit    DevIR -> Cranelift codegen + in-memory hot-swap execution harness
+[workspace]
+resolver = "2"
+members = ["blaze-parse", "blaze-ir", "blaze-jit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/grloper/blaze"
+authors = ["Blaze Contributors"]
+
+# Single source of truth for third-party versions. Members opt in with
+# `dep.workspace = true`, keeping the incremental compiler's dependency graph
+# internally consistent across crates.
+[workspace.dependencies]
+# --- Frontend ---
+logos = "0.16"
+rowan = "0.16"
+# --- Incremental engine ---
+salsa = "0.28"
+# --- Codegen backend (Cranelift, bypassing LLVM) ---
+cranelift-codegen = "0.134"
+cranelift-frontend = "0.134"
+cranelift-jit = "0.134"
+cranelift-module = "0.134"
+cranelift-native = "0.134"
+# --- Utilities ---
+target-lexicon = "0.13"
+
+# Internal crates
+blaze-parse = { path = "blaze-parse" }
+blaze-ir = { path = "blaze-ir" }
+
+[profile.release]
+# The incremental loop optimizes for developer latency; keep codegen fast but
+# still let LLVM tidy the host binary that drives the JIT.
+opt-level = 2
+lto = "thin"
