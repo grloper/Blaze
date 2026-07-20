@@ -14,8 +14,10 @@
 
 pub mod codegen;
 pub mod engine;
+pub mod live;
 pub mod query;
 
 pub use codegen::{compile_isolated, host_isa};
 pub use engine::JitEngine;
+pub use live::{CallError, EditClass, LiveRuntime, ReloadReport, ScriptHost};
 pub use query::{compiled_machine_code, jit_program, CompiledFunction};

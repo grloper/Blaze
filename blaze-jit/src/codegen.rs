@@ -176,7 +176,7 @@ pub fn build_body(builder: &mut FunctionBuilder, node: &FunctionNode, emitter: &
             IrOp::Branch(cond, then_label, else_label) => {
                 let c = builder.use_var(vars[*cond as usize]);
                 // Normalize to a flag so `brif` sees a canonical boolean.
-                let flag = builder.ins().icmp_imm(IntCC::NotEqual, c, 0);
+                let flag = builder.ins().icmp_imm_s(IntCC::NotEqual, c, 0);
                 builder
                     .ins()
                     .brif(flag, blocks[then_label], &[], blocks[else_label], &[]);
@@ -216,7 +216,7 @@ fn emit_guarded_sdiv(builder: &mut FunctionBuilder, a: Value, b: Value) -> Value
     let min = builder.ins().iconst(types::I64, i64::MIN);
     let neg_one = builder.ins().iconst(types::I64, -1);
 
-    let b_is_zero = builder.ins().icmp_imm(IntCC::Equal, b, 0);
+    let b_is_zero = builder.ins().icmp_imm_s(IntCC::Equal, b, 0);
     let a_is_min = builder.ins().icmp(IntCC::Equal, a, min);
     let b_is_neg_one = builder.ins().icmp(IntCC::Equal, b, neg_one);
     let overflows = builder.ins().band(a_is_min, b_is_neg_one);

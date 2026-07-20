@@ -36,6 +36,7 @@ cranelift-module = "0.134"
 cranelift-native = "0.134"
 # --- Utilities ---
 target-lexicon = "0.13"
+libc = "0.2"
 
 # Internal crates
 blaze-parse = { path = "blaze-parse" }

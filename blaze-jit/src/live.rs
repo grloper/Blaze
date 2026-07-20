@@ -1,0 +1,661 @@
+//! The **live-swap runtime**: hot reload that is correct by construction.
+//!
+//! Every call between Blaze functions is compiled as an indirect call through a
+//! process-stable **slot table** (one `mmap`'d atomic pointer per function).
+//! Reloading therefore never rewrites existing code — it compiles the changed
+//! functions into a fresh generation of executable pages and atomically
+//! repoints their slots.
+//!
+//! What makes the reload *sound* rather than hopeful is that the swap strategy
+//! is derived from the `salsa` query graph, not guessed:
+//!
+//!  * The **blast radius** of an edit is exactly the set of functions whose
+//!    `lowered_dev_ir` changed. The graph's firewall guarantees a body-only
+//!    edit keeps every caller's DevIR — and therefore its machine code —
+//!    byte-identical, so patching the edited function's single slot is globally
+//!    consistent. That is [`EditClass::SafeSwap`]: one atomic store, zero
+//!    pause, valid under concurrent execution.
+//!  * When a signature changes, the graph *forces* every caller into the blast
+//!    radius (callers depend on callee signatures). The runtime then recompiles
+//!    the whole radius and commits it under a quiescence barrier so no thread
+//!    can ever observe a caller and callee with mismatched ABIs. That is
+//!    [`EditClass::Relink`] — still crash-free, never a silent corruption.
+//!
+//! A naive reloader patches pointers and hopes the ABI didn't change. Blaze
+//! *knows*, because the incremental graph proves it.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
+
+use cranelift_codegen::ir::{InstBuilder, MemFlagsData, UserFuncName, Value};
+use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_jit::{JITBuilder, JITModule};
+use cranelift_module::{default_libcall_names, Linkage, Module};
+
+use blaze_ir::db::{BlazeDatabaseImpl, ExecTrace, FnKey, SourceProgram};
+use blaze_ir::lower::{lowered_dev_ir, program_outline};
+use blaze_ir::{FunctionId, FunctionNode};
+use salsa::Setter;
+
+use crate::codegen::{build_body, clif_signature, host_isa, CallEmitter};
+
+/// Maximum number of distinct functions (source + host) a runtime can hold.
+const TABLE_CAPACITY: usize = 1024;
+
+/// Maximum call arity `LiveRuntime::call` can dispatch.
+const MAX_ARITY: usize = 8;
+
+/// Target of any slot whose function is missing (never defined, or removed by
+/// an edit). Returning a defined `0` keeps a live process crash-free even when
+/// an edit deletes a function out from under a caller.
+extern "C" fn missing_stub() -> i64 {
+    0
+}
+
+// ---------------------------------------------------------------------------
+// Slot table
+// ---------------------------------------------------------------------------
+
+/// A page-aligned, `mmap`-allocated array of atomic function-pointer slots.
+///
+/// The table's address is stable for the life of the runtime — generated code
+/// bakes `&table[slot]` in as an absolute constant and performs an atomic load
+/// on every call, which is what makes pointer hot-swapping a single
+/// release-store from the reloading thread.
+struct SwapTable {
+    base: *mut AtomicU64,
+    bytes: usize,
+}
+
+// SAFETY: the table is a fixed allocation of atomics; all mutation goes through
+// atomic operations.
+unsafe impl Send for SwapTable {}
+unsafe impl Sync for SwapTable {}
+
+impl SwapTable {
+    fn new() -> Result<Self, String> {
+        let bytes = TABLE_CAPACITY * std::mem::size_of::<AtomicU64>();
+        // SAFETY: anonymous private mapping, checked for MAP_FAILED below.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                bytes,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if base == libc::MAP_FAILED {
+            return Err("mmap of the swap table failed".to_string());
+        }
+        let table = SwapTable { base: base.cast::<AtomicU64>(), bytes };
+        // Every slot starts as the missing stub, so even a call emitted against
+        // a never-defined function lands somewhere harmless.
+        for i in 0..TABLE_CAPACITY {
+            table.slot(i).store(missing_stub as extern "C" fn() -> i64 as usize as u64, Ordering::Release);
+        }
+        Ok(table)
+    }
+
+    #[inline]
+    fn slot(&self, index: usize) -> &AtomicU64 {
+        assert!(index < TABLE_CAPACITY);
+        // SAFETY: `base` points at TABLE_CAPACITY zero-initialized AtomicU64s,
+        // properly aligned by mmap's page alignment; index is bounds-checked.
+        unsafe { &*self.base.add(index) }
+    }
+
+    /// Absolute address of a slot, for baking into generated code.
+    #[inline]
+    fn slot_addr(&self, index: usize) -> usize {
+        assert!(index < TABLE_CAPACITY);
+        self.base as usize + index * std::mem::size_of::<AtomicU64>()
+    }
+}
+
+impl Drop for SwapTable {
+    fn drop(&mut self) {
+        // SAFETY: unmapping exactly the region mapped in `new`.
+        unsafe { libc::munmap(self.base.cast(), self.bytes) };
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Table-indirect call emission
+// ---------------------------------------------------------------------------
+
+/// Emits every Blaze→Blaze call as `call_indirect` through the callee's slot:
+/// an absolute-address constant, an atomic load, and an indirect call. No
+/// relocations exist between functions, which is why generations never need
+/// relinking against each other.
+struct TableEmitter<'a> {
+    call_conv: CallConv,
+    table: &'a SwapTable,
+    slots: &'a HashMap<FunctionId, usize>,
+}
+
+impl CallEmitter for TableEmitter<'_> {
+    fn emit_call(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        callee: FunctionId,
+        args: &[Value],
+    ) -> Value {
+        let slot_index = *self
+            .slots
+            .get(&callee)
+            .expect("slot allocated for every callee before compilation");
+        let slot_addr = self.table.slot_addr(slot_index) as i64;
+
+        let addr = builder.ins().iconst(cranelift_codegen::ir::types::I64, slot_addr);
+        // Acquire-load pairs with the reloader's release-store, so a caller
+        // that observes a new pointer also observes the fully written code
+        // behind it.
+        let target = builder.ins().atomic_load(
+            cranelift_codegen::ir::types::I64,
+            MemFlagsData::trusted(),
+            addr,
+        );
+        let sig_ref = builder.import_signature(clif_signature(args.len(), self.call_conv));
+        let call = builder.ins().call_indirect(sig_ref, target, args);
+        builder.inst_results(call)[0]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Classification
+// ---------------------------------------------------------------------------
+
+/// How an edit may be applied, proved from the query graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditClass {
+    /// The edit changed no function's DevIR (formatting, comments, or code
+    /// that lowers identically). Nothing is compiled; nothing is patched.
+    NoEffect,
+    /// Every changed function kept its ABI signature. The firewall guarantees
+    /// no caller's code changed, so repointing the changed slots is globally
+    /// consistent — applied atomically, without pausing execution.
+    SafeSwap,
+    /// At least one signature changed (or a function was removed). The graph
+    /// pulls every affected caller into the blast radius; the whole set is
+    /// recompiled and committed under a quiescence barrier so callers and
+    /// callees can never be observed with mismatched ABIs.
+    Relink,
+    /// Reserved: a change to persistent state layout, requiring a data
+    /// migration before code can be swapped. Blaze functions are currently
+    /// pure over `i64`s — state lives in the host, which is exactly what makes
+    /// state survive every reload — so this classification cannot yet occur.
+    StateMigration,
+}
+
+/// What a [`LiveRuntime::reload`] did, and what it cost.
+#[derive(Debug, Clone)]
+pub struct ReloadReport {
+    pub class: EditClass,
+    /// Functions whose DevIR changed (the blast radius), in outline order.
+    pub changed: Vec<String>,
+    /// Functions that did not exist before this reload.
+    pub added: Vec<String>,
+    /// Functions removed by this reload (their slots now hit the missing stub).
+    pub removed: Vec<String>,
+    /// Wall-clock time from source swap to fully committed pointers.
+    pub latency: Duration,
+    /// Monotonic generation counter (0 is the initial load).
+    pub generation: usize,
+}
+
+/// Why a [`LiveRuntime::call`] could not run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CallError {
+    UnknownFunction(String),
+    ArityMismatch { name: String, expected: usize, got: usize },
+    UnsupportedArity(usize),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallError::UnknownFunction(name) => write!(f, "unknown function `{name}`"),
+            CallError::ArityMismatch { name, expected, got } => {
+                write!(f, "`{name}` takes {expected} argument(s), got {got}")
+            }
+            CallError::UnsupportedArity(n) => write!(f, "arity {n} exceeds the dispatch limit"),
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
+
+// ---------------------------------------------------------------------------
+// The runtime
+// ---------------------------------------------------------------------------
+
+/// Per-name dispatch data used by [`LiveRuntime::call`].
+#[derive(Debug, Clone, Copy)]
+struct DispatchEntry {
+    slot: usize,
+    arity: usize,
+}
+
+/// Mutable compilation state, serialized behind one mutex. The call path never
+/// touches it.
+struct LiveInner {
+    db: BlazeDatabaseImpl,
+    src: SourceProgram,
+    isa: OwnedTargetIsa,
+    /// DevIR snapshot of the previous generation, for blast-radius diffing.
+    prev: HashMap<String, std::sync::Arc<FunctionNode>>,
+    /// Stable slot assignment. A name keeps its slot for the runtime's life.
+    slots: HashMap<FunctionId, usize>,
+    next_slot: usize,
+    /// Host-registered native functions: name → (arity, fn pointer).
+    host_fns: HashMap<String, (usize, u64)>,
+    /// Retired generations. Old code pages are deliberately kept alive for the
+    /// life of the runtime: a concurrent caller may still be executing them
+    /// mid-swap, and for a dev-loop tool the cost (old versions of *edited
+    /// functions only*) is negligible by design.
+    generations: Vec<JITModule>,
+    generation: usize,
+}
+
+/// An embeddable, hot-swappable Blaze program.
+///
+/// `call` is safe under concurrency with `reload`: body-only edits commit with
+/// a single atomic store per function, and ABI edits quiesce in-flight calls
+/// (the dispatch lock) before committing the whole blast radius at once.
+pub struct LiveRuntime {
+    table: SwapTable,
+    /// Read-held for the duration of every root call; write-held while
+    /// committing a relink or a multi-function swap. This is the quiescence
+    /// barrier that makes ABI transitions atomic from every caller's view.
+    dispatch: RwLock<HashMap<String, DispatchEntry>>,
+    inner: Mutex<LiveInner>,
+}
+
+impl LiveRuntime {
+    /// Compile `source` and stand the program up, ready to call.
+    pub fn new(source: &str) -> Result<Self, String> {
+        let db = BlazeDatabaseImpl::default();
+        let src = SourceProgram::new(&db, source.to_string());
+        let isa = host_isa()?;
+
+        let runtime = LiveRuntime {
+            table: SwapTable::new()?,
+            dispatch: RwLock::new(HashMap::new()),
+            inner: Mutex::new(LiveInner {
+                db,
+                src,
+                isa,
+                prev: HashMap::new(),
+                slots: HashMap::new(),
+                next_slot: 0,
+                host_fns: HashMap::new(),
+                generations: Vec::new(),
+                generation: 0,
+            }),
+        };
+        {
+            let mut inner = runtime.inner.lock().unwrap();
+            runtime.load_generation(&mut inner, None)?;
+        }
+        Ok(runtime)
+    }
+
+    /// Register a native function callable from Blaze code as `name(...)`.
+    ///
+    /// Takes effect immediately: any Blaze call site targeting `name` (current
+    /// or from future reloads) dispatches to `ptr` through the slot table.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must be an `extern "C"` function taking exactly `arity` `i64`
+    /// parameters and returning `i64`, and must remain valid for the life of
+    /// the runtime. It must not call back into this runtime.
+    pub unsafe fn register_host_fn(&self, name: &str, arity: usize, ptr: *const u8) {
+        let mut inner = self.inner.lock().unwrap();
+        let id = blaze_ir::function_id_of(name);
+        let slot = Self::ensure_slot(&mut inner, id);
+        inner.host_fns.insert(name.to_string(), (arity, ptr as u64));
+        self.table.slot(slot).store(ptr as u64, Ordering::Release);
+        self.dispatch
+            .write()
+            .unwrap()
+            .insert(name.to_string(), DispatchEntry { slot, arity });
+    }
+
+    /// Swap the program's source. Classifies the edit from the query graph,
+    /// recompiles exactly the blast radius, and commits it with the weakest
+    /// synchronization that is still sound for that class.
+    pub fn reload(&self, new_source: &str) -> Result<ReloadReport, String> {
+        let started = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+
+        let src = inner.src;
+        src.set_text(&mut inner.db).to(new_source.to_string());
+
+        let report = self.load_generation(&mut inner, Some(started))?;
+        Ok(report)
+    }
+
+    /// Invoke `name` with `args`. Safe to call from any thread, concurrently
+    /// with reloads.
+    pub fn call(&self, name: &str, args: &[i64]) -> Result<i64, CallError> {
+        // Root-call read lock: held while Blaze code runs, so a Relink commit
+        // (write lock) can never interleave with an in-flight call.
+        let dispatch = self.dispatch.read().unwrap();
+        let entry = dispatch
+            .get(name)
+            .copied()
+            .ok_or_else(|| CallError::UnknownFunction(name.to_string()))?;
+        if entry.arity != args.len() {
+            return Err(CallError::ArityMismatch {
+                name: name.to_string(),
+                expected: entry.arity,
+                got: args.len(),
+            });
+        }
+        if args.len() > MAX_ARITY {
+            return Err(CallError::UnsupportedArity(args.len()));
+        }
+
+        let code = self.table.slot(entry.slot).load(Ordering::Acquire) as usize as *const u8;
+
+        // SAFETY: `code` is either the missing stub or a finalized function
+        // compiled with the `(i64 × arity) -> i64` signature; the arity was
+        // checked against the dispatch table, which is updated atomically with
+        // the slots it describes.
+        let result = unsafe { dispatch_by_arity(code, args) };
+        Ok(result)
+    }
+
+    /// Number of completed generations (0 after `new`, +1 per effective reload).
+    pub fn generation(&self) -> usize {
+        self.inner.lock().unwrap().generation
+    }
+
+    /// Enable query-execution tracing on the underlying database (testing:
+    /// proves which queries re-ran during a reload).
+    pub fn enable_tracing(&self) -> ExecTrace {
+        self.inner.lock().unwrap().db.enable_tracing()
+    }
+
+    // -- internals ----------------------------------------------------------
+
+    fn ensure_slot(inner: &mut LiveInner, id: FunctionId) -> usize {
+        if let Some(&slot) = inner.slots.get(&id) {
+            return slot;
+        }
+        let slot = inner.next_slot;
+        assert!(slot < TABLE_CAPACITY, "swap table exhausted");
+        inner.next_slot += 1;
+        inner.slots.insert(id, slot);
+        slot
+    }
+
+    /// Pull the current DevIR through the incremental graph, diff it against
+    /// the previous generation, compile the blast radius, and commit.
+    ///
+    /// `edit_started` is `None` for the initial load (no report classification
+    /// is meaningful) and `Some` for reloads.
+    fn load_generation(
+        &self,
+        inner: &mut LiveInner,
+        edit_started: Option<Instant>,
+    ) -> Result<ReloadReport, String> {
+        let src = inner.src;
+
+        // 1. Demand the whole program through the query graph. Unchanged
+        //    functions are memo hits; the firewall keeps body edits contained.
+        let names = program_outline(&inner.db, src);
+        let mut current: Vec<(String, std::sync::Arc<FunctionNode>)> = Vec::with_capacity(names.len());
+        for name in names.iter() {
+            let key = FnKey::new(&inner.db, name.clone());
+            current.push((name.clone(), lowered_dev_ir(&inner.db, src, key)));
+        }
+
+        // 2. Blast radius = functions whose DevIR *content* differs from the
+        //    previous generation. The graph already minimized this set: a
+        //    body-only edit re-lowers one function; an ABI edit re-lowers the
+        //    callee and every caller (they depend on its signature).
+        let mut changed: Vec<(String, std::sync::Arc<FunctionNode>)> = Vec::new();
+        let mut added: Vec<String> = Vec::new();
+        let mut signature_changed = false;
+        for (name, node) in &current {
+            match inner.prev.get(name) {
+                Some(prev_node) => {
+                    if **prev_node != **node {
+                        if prev_node.signature != node.signature {
+                            signature_changed = true;
+                        }
+                        changed.push((name.clone(), node.clone()));
+                    }
+                }
+                None => {
+                    if !inner.host_fns.contains_key(name) {
+                        added.push(name.clone());
+                        changed.push((name.clone(), node.clone()));
+                    }
+                }
+            }
+        }
+        let current_names: std::collections::HashSet<&str> =
+            current.iter().map(|(n, _)| n.as_str()).collect();
+        let removed: Vec<String> = inner
+            .prev
+            .keys()
+            .filter(|n| !current_names.contains(n.as_str()))
+            .cloned()
+            .collect();
+
+        let is_initial = edit_started.is_none();
+        if changed.is_empty() && removed.is_empty() && !is_initial {
+            return Ok(ReloadReport {
+                class: EditClass::NoEffect,
+                changed: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
+                generation: inner.generation,
+            });
+        }
+
+        let class = if signature_changed || !removed.is_empty() {
+            EditClass::Relink
+        } else {
+            EditClass::SafeSwap
+        };
+
+        // 3. Allocate slots for everything the new code mentions, *before*
+        //    compiling, so emitted slot addresses are final.
+        for (_, node) in &changed {
+            Self::ensure_slot(inner, node.id);
+            for dep in &node.dependencies {
+                Self::ensure_slot(inner, *dep);
+            }
+        }
+
+        // 4. Compile only the blast radius into a fresh generation of
+        //    executable pages (JITModule handles the PROT_WRITE→PROT_EXEC
+        //    transition and instruction-cache coherence).
+        let mut compiled: Vec<(String, usize, cranelift_module::FuncId)> = Vec::new();
+        let mut module = JITModule::new(JITBuilder::with_isa(
+            inner.isa.clone(),
+            default_libcall_names(),
+        ));
+        let call_conv = inner.isa.default_call_conv();
+        let mut fb_ctx = FunctionBuilderContext::new();
+        for (name, node) in &changed {
+            let sig = clif_signature(node.signature.arity(), call_conv);
+            let func_id = module
+                .declare_function(name, Linkage::Export, &sig)
+                .map_err(|e| format!("declare `{name}` failed: {e}"))?;
+
+            let mut ctx = module.make_context();
+            ctx.func.signature = sig;
+            ctx.func.name = UserFuncName::user(0, node.id.0);
+            {
+                let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+                let mut emitter = TableEmitter {
+                    call_conv,
+                    table: &self.table,
+                    slots: &inner.slots,
+                };
+                build_body(&mut builder, node, &mut emitter);
+                builder.finalize(inner.isa.frontend_config());
+            }
+            module
+                .define_function(func_id, &mut ctx)
+                .map_err(|e| format!("define `{name}` failed: {e}"))?;
+            module.clear_context(&mut ctx);
+
+            compiled.push((name.clone(), inner.slots[&node.id], func_id));
+        }
+        module
+            .finalize_definitions()
+            .map_err(|e| format!("finalize failed: {e}"))?;
+
+        // 5. Commit. The pointer stores are identical in both classes; what
+        //    differs is the synchronization the class *proves* is sufficient:
+        //     - SafeSwap of a single function: the firewall guarantees no other
+        //       code changed, so one release-store is globally consistent even
+        //       against concurrent callers. Lock-free.
+        //     - Relink (or a multi-function swap, where cross-function
+        //       consistency of the *set* matters): quiesce root calls via the
+        //       dispatch write lock, then commit everything at once.
+        // Lock-free only for the pure case: one existing function, body-only.
+        // Anything that touches the dispatch map (new names, removals, ABI
+        // changes, initial load) or patches multiple slots commits under the
+        // quiescence barrier so callers observe the set atomically.
+        let lock_free = class == EditClass::SafeSwap
+            && compiled.len() <= 1
+            && added.is_empty()
+            && removed.is_empty()
+            && !is_initial;
+        let commit = |dispatch: &mut HashMap<String, DispatchEntry>| {
+            for (name, slot, func_id) in &compiled {
+                let code = module.get_finalized_function(*func_id);
+                self.table.slot(*slot).store(code as u64, Ordering::Release);
+                let arity = current
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, node)| node.signature.arity())
+                    .unwrap_or(0);
+                dispatch.insert(name.clone(), DispatchEntry { slot: *slot, arity });
+            }
+            for name in &removed {
+                let id = blaze_ir::function_id_of(name);
+                if let Some(&slot) = inner.slots.get(&id) {
+                    self.table
+                        .slot(slot)
+                        .store(missing_stub as extern "C" fn() -> i64 as usize as u64, Ordering::Release);
+                }
+                dispatch.remove(name);
+            }
+        };
+
+        if lock_free {
+            // The dispatch map itself is untouched (same name, same slot, same
+            // arity) — only the slot's pointer moves, atomically.
+            for (_, slot, func_id) in &compiled {
+                let code = module.get_finalized_function(*func_id);
+                self.table.slot(*slot).store(code as u64, Ordering::Release);
+            }
+        } else {
+            let mut dispatch = self.dispatch.write().unwrap();
+            commit(&mut dispatch);
+        }
+
+        // 6. Retire the generation (kept alive: in-flight callers may still be
+        //    executing previous generations) and refresh the snapshot.
+        inner.generations.push(module);
+        inner.generation += 1;
+        inner.prev = current.into_iter().collect();
+
+        Ok(ReloadReport {
+            class: if is_initial { EditClass::SafeSwap } else { class },
+            changed: changed.iter().map(|(n, _)| n.clone()).collect(),
+            added,
+            removed,
+            latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
+            generation: inner.generation,
+        })
+    }
+}
+
+/// Transmute `code` to the C ABI signature selected by `args.len()` and call.
+///
+/// # Safety
+///
+/// `code` must be executable and follow the `(i64 × n) -> i64` C ABI for
+/// `n = args.len() <= MAX_ARITY`.
+unsafe fn dispatch_by_arity(code: *const u8, args: &[i64]) -> i64 {
+    use std::mem::transmute as t;
+    match *args {
+        [] => t::<*const u8, extern "C" fn() -> i64>(code)(),
+        [a] => t::<*const u8, extern "C" fn(i64) -> i64>(code)(a),
+        [a, b] => t::<*const u8, extern "C" fn(i64, i64) -> i64>(code)(a, b),
+        [a, b, c] => t::<*const u8, extern "C" fn(i64, i64, i64) -> i64>(code)(a, b, c),
+        [a, b, c, d] => t::<*const u8, extern "C" fn(i64, i64, i64, i64) -> i64>(code)(a, b, c, d),
+        [a, b, c, d, e] => t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64) -> i64>(code)(a, b, c, d, e),
+        [a, b, c, d, e, f] => {
+            t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64>(code)(a, b, c, d, e, f)
+        }
+        [a, b, c, d, e, f, g] => {
+            t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64>(code)(a, b, c, d, e, f, g)
+        }
+        [a, b, c, d, e, f, g, h] => t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64>(
+            code,
+        )(a, b, c, d, e, f, g, h),
+        _ => unreachable!("arity checked against MAX_ARITY before dispatch"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-watching host
+// ---------------------------------------------------------------------------
+
+/// A [`LiveRuntime`] bound to a `.blaze` file on disk, reloading on change.
+///
+/// Watching is dependency-free mtime polling — call [`ScriptHost::poll`] once
+/// per frame (or at any cadence you like) and apply the report it returns.
+pub struct ScriptHost {
+    runtime: LiveRuntime,
+    path: PathBuf,
+    last_modified: Option<SystemTime>,
+}
+
+impl ScriptHost {
+    /// Load `path` and compile it.
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, String> {
+        let path = path.into();
+        let source = std::fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
+        let last_modified = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        Ok(ScriptHost { runtime: LiveRuntime::new(&source)?, path, last_modified })
+    }
+
+    /// The underlying runtime, for calls and host-function registration.
+    pub fn runtime(&self) -> &LiveRuntime {
+        &self.runtime
+    }
+
+    /// If the file changed since the last poll, reload it and return the
+    /// report. Returns `Ok(None)` when nothing changed.
+    pub fn poll(&mut self) -> Result<Option<ReloadReport>, String> {
+        let modified = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .map_err(|e| format!("failed to stat {}: {e}", self.path.display()))?;
+        if self.last_modified == Some(modified) {
+            return Ok(None);
+        }
+        self.last_modified = Some(modified);
+        let source = std::fs::read_to_string(&self.path)
+            .map_err(|e| format!("failed to read {}: {e}", self.path.display()))?;
+        self.runtime.reload(&source).map(Some)
+    }
+}

@@ -66,6 +66,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "libc",
  "salsa",
  "target-lexicon",
 ]

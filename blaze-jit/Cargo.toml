@@ -18,3 +18,4 @@ cranelift-jit.workspace = true
 cranelift-module.workspace = true
 cranelift-native.workspace = true
 target-lexicon.workspace = true
+libc.workspace = true
