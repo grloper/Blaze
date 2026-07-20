@@ -10,4 +10,5 @@ authors.workspace = true
 
 [dependencies]
 salsa.workspace = true
+rowan.workspace = true
 blaze-parse.workspace = true

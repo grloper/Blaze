@@ -32,23 +32,36 @@ use blaze_parse::ast::{BinOp, Block, CallExpr, ElseArm, Expr, Function, SourceFi
 use crate::db::{BlazeDatabase, FnKey, SourceProgram};
 use crate::ir::{function_id_of, CmpKind, FunctionNode, IrBuilder, Signature, Type};
 
+/// The lossless green tree of the whole file — parsed **once per revision**.
+///
+/// Everything downstream slices this tree instead of re-parsing, so the
+/// per-edit analysis cost is one parse plus cheap per-function extraction,
+/// independent of how many functions consume it. (`GreenNode` is an immutable,
+/// `Send + Sync`, reference-counted tree; cloning is pointer-cheap.)
+#[salsa::tracked(returns(clone))]
+pub fn parse_program(db: &dyn BlazeDatabase, src: SourceProgram) -> rowan::GreenNode {
+    db.record_exec("parse_program".into());
+    blaze_parse::parse(src.text(db)).green()
+}
+
 /// The ordered list of top-level function names in the program.
 ///
-/// Depends on the full source, so it re-runs on any edit — but it backdates
-/// whenever the *set and order* of function names is unchanged, insulating
-/// consumers that only care about program structure from body edits.
+/// Re-runs when the tree changes, but backdates whenever the *set and order*
+/// of function names is unchanged, insulating consumers that only care about
+/// program structure from body edits.
 #[salsa::tracked(returns(clone))]
 pub fn program_outline(db: &dyn BlazeDatabase, src: SourceProgram) -> Arc<Vec<String>> {
     db.record_exec("program_outline".into());
-    let file = SourceFile::parse(src.text(db));
+    let file = SourceFile::from_green(parse_program(db, src));
     let names = file.functions().filter_map(|f| f.name()).collect::<Vec<_>>();
     Arc::new(names)
 }
 
 /// The exact source text of function `key`, or empty if it is not defined.
 ///
-/// This is the per-function firewall node: it re-executes on any edit (it reads
-/// the whole file) but backdates unless *this* function's own bytes changed.
+/// This is the per-function firewall node: it re-executes on any edit (the
+/// shared tree changed) but backdates unless *this* function's own bytes
+/// changed — terminating the cascade for every untouched function.
 #[salsa::tracked(returns(deref))]
 pub fn function_text<'db>(
     db: &'db dyn BlazeDatabase,
@@ -57,7 +70,7 @@ pub fn function_text<'db>(
 ) -> Arc<str> {
     let name = key.name(db);
     db.record_exec(format!("function_text({name})"));
-    let file = SourceFile::parse(src.text(db));
+    let file = SourceFile::from_green(parse_program(db, src));
     let text = file
         .functions()
         .find(|f| f.name().as_deref() == Some(name.as_str()))

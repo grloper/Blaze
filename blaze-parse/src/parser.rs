@@ -66,6 +66,13 @@ impl Parse {
         SyntaxNode::new_root(self.green.clone())
     }
 
+    /// The immutable green tree itself. `GreenNode` is cheap to clone and
+    /// `Send + Sync`, which makes it storable in an incremental query database
+    /// so a file is parsed once per revision and *sliced* per function.
+    pub fn green(&self) -> GreenNode {
+        self.green.clone()
+    }
+
     /// Diagnostics gathered while parsing (empty on well-formed input).
     pub fn errors(&self) -> &[SyntaxError] {
         &self.errors

@@ -75,6 +75,12 @@ impl SourceFile {
         SourceFile::cast(parse.syntax()).expect("root is always SOURCE_FILE")
     }
 
+    /// Re-root a previously parsed green tree (see [`crate::Parse::green`]).
+    /// Red nodes are built lazily, so this is O(1) until the tree is walked.
+    pub fn from_green(green: rowan::GreenNode) -> Self {
+        SourceFile::cast(SyntaxNode::new_root(green)).expect("root is always SOURCE_FILE")
+    }
+
     /// Top-level function definitions, in source order.
     pub fn functions(&self) -> impl Iterator<Item = Function> + '_ {
         children(&self.0)
