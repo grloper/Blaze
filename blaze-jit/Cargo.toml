@@ -1,0 +1,20 @@
+[package]
+name = "blaze-jit"
+description = "DevIR -> Cranelift codegen and in-memory hot-swap execution harness."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+salsa.workspace = true
+blaze-ir.workspace = true
+blaze-parse.workspace = true
+cranelift-codegen.workspace = true
+cranelift-frontend.workspace = true
+cranelift-jit.workspace = true
+cranelift-module.workspace = true
+cranelift-native.workspace = true
+target-lexicon.workspace = true

@@ -1,0 +1,13 @@
+[package]
+name = "blaze-ir"
+description = "SSA-style DevIR lowering wired into a salsa demand-driven query database."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+salsa.workspace = true
+blaze-parse.workspace = true
