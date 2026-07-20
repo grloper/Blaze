@@ -1,16 +1,21 @@
-//! `blaze-jit` — the Cranelift code-generation backend and hot-swap execution
+//! `blaze-jit` — the Cranelift code-generation backend and in-memory execution
 //! harness (architecture Milestones 2 & 3).
 //!
-//! This crate ingests validated [`blaze_ir::FunctionNode`]s and translates the
-//! DevIR into Cranelift IR, JIT-compiles them into executable memory, and
-//! (Milestone 3) hot-swaps the resulting code pages under a running program.
+//! It ingests validated [`blaze_ir::FunctionNode`]s and:
+//!  * translates DevIR into Cranelift IR ([`codegen`]),
+//!  * serializes per-function machine code back into the `salsa` graph
+//!    ([`compiled_machine_code`]), so codegen inherits the incremental firewall,
+//!  * links whole programs into executable `mmap` pages and runs them
+//!    ([`JitEngine`], via Cranelift's `JITModule`).
 //!
-//! Milestone 1 (the lexer, parser, DevIR graph, and incremental firewall) is
-//! implemented and verified in `blaze-parse` and `blaze-ir`. The backend is
-//! introduced next; this module is intentionally left as the seam it plugs into.
+//! The DevIR-level firewall (proved in `blaze-ir`) carries all the way through:
+//! because [`compiled_machine_code`] depends only on `lowered_dev_ir`, editing a
+//! callee's body recompiles that callee's code while callers stay memoized.
 
-#![doc(html_no_source)]
+pub mod codegen;
+pub mod engine;
+pub mod query;
 
-/// Placeholder marker so the crate participates in the workspace build while the
-/// Cranelift backend (Milestone 2) is brought online in the following commits.
-pub const MILESTONE: &str = "1-complete; jit backend pending";
+pub use codegen::{compile_isolated, host_isa};
+pub use engine::JitEngine;
+pub use query::{compiled_machine_code, jit_program, CompiledFunction};

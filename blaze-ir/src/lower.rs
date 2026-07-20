@@ -38,7 +38,7 @@ use crate::ir::{function_id_of, FunctionNode, IrBuilder, Signature, Type};
 /// whenever the *set and order* of function names is unchanged, insulating
 /// consumers that only care about program structure from body edits.
 #[salsa::tracked(returns(clone))]
-pub fn program_outline<'db>(db: &'db dyn BlazeDatabase, src: SourceProgram) -> Arc<Vec<String>> {
+pub fn program_outline(db: &dyn BlazeDatabase, src: SourceProgram) -> Arc<Vec<String>> {
     db.record_exec("program_outline".into());
     let file = SourceFile::parse(src.text(db));
     let names = file.functions().filter_map(|f| f.name()).collect::<Vec<_>>();
@@ -101,10 +101,10 @@ pub fn lowered_dev_ir<'db>(
 
     let text = function_text(db, src, key);
     let Some(func) = parse_single(text) else {
-        return Arc::new(FunctionNode::empty(function_id_of(&name)));
+        return Arc::new(FunctionNode::empty(function_id_of(name)));
     };
     let signature = function_signature(db, src, key);
-    let node = Lowerer { db, src }.lower_function(&func, &name, signature);
+    let node = Lowerer { db, src }.lower_function(&func, name, signature);
     Arc::new(node)
 }
 
