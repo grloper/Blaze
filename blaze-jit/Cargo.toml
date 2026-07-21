@@ -19,3 +19,10 @@ cranelift-module.workspace = true
 cranelift-native.workspace = true
 target-lexicon.workspace = true
 libc.workspace = true
+
+# Bench-only: an embedded AST interpreter to measure Blaze's native JIT dispatch
+# against — the honest apples-to-apples baseline for "how much faster than an
+# interpreter is a hot-swapped native function?" Used solely by
+# `examples/bench_vs_interpreter.rs`; not part of the library's dependency graph.
+[dev-dependencies]
+rhai = "1"

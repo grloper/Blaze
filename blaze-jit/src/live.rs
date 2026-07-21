@@ -566,8 +566,6 @@ struct Canary {
     /// The candidate's source — the snapshot `promote` reinstalls into the live
     /// program through the ordinary reload protocol.
     source: String,
-    /// Advanced on every candidate-eligible call, for 1-in-N sampling.
-    counter: AtomicU64,
     samples: AtomicU64,
     divergences: AtomicU64,
     candidate_faults: AtomicU64,
@@ -583,7 +581,6 @@ impl Canary {
             program,
             policy,
             source,
-            counter: AtomicU64::new(0),
             samples: AtomicU64::new(0),
             divergences: AtomicU64::new(0),
             candidate_faults: AtomicU64::new(0),
@@ -595,17 +592,6 @@ impl Canary {
 
     fn is_aborted(&self) -> bool {
         self.aborted.load(Ordering::Relaxed) != CANARY_RUNNING
-    }
-
-    /// Advance the sampler and report whether *this* call should be mirrored.
-    /// Returns `false` once the canary has auto-aborted, so a dead canary stops
-    /// spending shadow executions.
-    fn should_mirror(&self) -> bool {
-        if self.is_aborted() {
-            return false;
-        }
-        let n = self.counter.fetch_add(1, Ordering::Relaxed);
-        self.policy.sample_every <= 1 || n % self.policy.sample_every == 0
     }
 
     /// Run the candidate as a shadow of one sampled call and fold the comparison
@@ -751,6 +737,16 @@ pub struct LiveRuntime {
     /// authoritative state is `canary` below; this is only an optimization, and
     /// a stale read merely delays a sample by one call.
     canary_active: AtomicBool,
+    /// The 1-in-N canary sampler, kept *off* the canary's lock so an un-sampled
+    /// call on the canary path costs two relaxed loads (rate + this counter's
+    /// increment) instead of a mutex acquisition. `canary_rate` is the N, or `0`
+    /// when no candidate should be sampled — either idle, or auto-aborted (the
+    /// sampler is switched off the moment a shadow trips a policy threshold). The
+    /// lock is taken *only* on the sampled fraction, to run the shadow. This is
+    /// what makes "live p99 never moves more than the mirroring cost" literally
+    /// true: the calls you don't mirror pay no lock at all.
+    canary_rate: AtomicU64,
+    canary_counter: AtomicU64,
     /// The active canary, if any: a candidate program shadowed against this one.
     /// `Box`ed to break the `LiveRuntime` → `Canary` → `LiveRuntime` type cycle.
     canary: Mutex<Option<Box<Canary>>>,
@@ -800,6 +796,8 @@ impl LiveRuntime {
             metrics_enabled: AtomicBool::new(false),
             metrics: (0..TABLE_CAPACITY).map(|_| FnMetrics::default()).collect(),
             canary_active: AtomicBool::new(false),
+            canary_rate: AtomicU64::new(0),
+            canary_counter: AtomicU64::new(0),
             canary: Mutex::new(None),
             inner: Mutex::new(LiveInner {
                 db,
@@ -823,8 +821,26 @@ impl LiveRuntime {
     /// [`Self::new`], but the primary's host functions are registered *before*
     /// the first load so a candidate that calls them is not spuriously rejected.
     /// A candidate that is genuinely defective returns its diagnostics as `Err`.
-    fn new_candidate(source: &str, host_fns: &HashMap<String, (usize, u64)>) -> Result<Self, String> {
+    ///
+    /// The candidate is stood up under the primary's *current* resource limits —
+    /// its call-depth limit (baked into the entry guards at compile time) and its
+    /// per-call fuel budget — so the shadow evaluates the candidate under exactly
+    /// the production conditions it would face if promoted. A candidate whose new
+    /// logic recurses or loops away thus traps on the *same* budget the live
+    /// program enforces, and the divergence is caught here rather than after it
+    /// ships.
+    fn new_candidate(
+        source: &str,
+        host_fns: &HashMap<String, (usize, u64)>,
+        max_depth: u64,
+        fuel_budget: u64,
+    ) -> Result<Self, String> {
         let runtime = Self::assemble(source)?;
+        // Fuel is read per call, so setting it now covers every shadow call.
+        runtime.fuel_budget.store(fuel_budget, Ordering::Relaxed);
+        // The depth limit is compiled into the entry guards, so it must be set
+        // *before* the load below builds the candidate's code.
+        runtime.inner.lock().unwrap().max_depth = max_depth;
         for (name, (arity, ptr)) in host_fns {
             // SAFETY: each pointer came from a valid registration on the primary
             // and must (by that call's contract) outlive the primary — which
@@ -1224,17 +1240,30 @@ impl LiveRuntime {
     /// [`Self::abort_canary`] it first.
     pub fn canary(&self, new_source: &str, policy: CanaryPolicy) -> Result<(), String> {
         // The candidate must know the primary's host functions, or the gate
-        // would reject any call to them as undefined.
-        let host_fns = self.inner.lock().unwrap().host_fns.clone();
-        let program = Self::new_candidate(new_source, &host_fns)?;
+        // would reject any call to them as undefined; and it inherits the
+        // primary's live resource limits so the shadow runs under production
+        // conditions (a runaway candidate traps on the same budget it would
+        // face if promoted).
+        let (host_fns, max_depth, fuel_budget) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.host_fns.clone(), inner.max_depth, self.fuel_budget.load(Ordering::Relaxed))
+        };
+        let program = Self::new_candidate(new_source, &host_fns, max_depth, fuel_budget)?;
 
         let mut guard = self.canary.lock().unwrap();
         if guard.is_some() {
             return Err("a canary is already active; promote or abort it first".to_string());
         }
         *guard = Some(Box::new(Canary::new(program, policy, new_source.to_string())));
-        // Publish *after* the candidate is in place, so `call_canary` never
-        // observes the fast-path flag set with no canary behind it.
+        // Arm the lock-free sampler: reset the counter and set the rate (N, at
+        // least 1 — a rate of 0 or 1 in the policy both mean "mirror every
+        // call"). These are written *before* the `Release` store of
+        // `canary_active` below, so a reader that acquires `canary_active == true`
+        // also sees the rate and a fresh counter — never a stale one.
+        self.canary_counter.store(0, Ordering::Relaxed);
+        self.canary_rate.store(policy.sample_every.max(1), Ordering::Relaxed);
+        // Publish *after* the candidate and sampler are in place, so `call_canary`
+        // never observes the fast-path flag set with no canary behind it.
         self.canary_active.store(true, Ordering::Release);
         Ok(())
     }
@@ -1255,22 +1284,32 @@ impl LiveRuntime {
         if !self.canary_active.load(Ordering::Acquire) {
             return self.call(name, args);
         }
-        // Decide sampling under a brief lock, then release it *before* running
-        // the primary so live calls are never serialized by the canary.
-        let sampling = {
-            let guard = self.canary.lock().unwrap();
-            guard.as_ref().is_some_and(|c| c.should_mirror())
+        // A canary is active. Decide whether *this* call is sampled with two
+        // relaxed atomics and no lock — so the calls we don't mirror pay nothing
+        // beyond that. `rate == 0` means idle or auto-aborted: skip straight to
+        // the live call.
+        let rate = self.canary_rate.load(Ordering::Relaxed);
+        let sampling = rate != 0 && {
+            let n = self.canary_counter.fetch_add(1, Ordering::Relaxed);
+            n % rate == 0
         };
         let primary_start = if sampling { Some(Instant::now()) } else { None };
         let primary = self.call(name, args);
         if let Some(start) = primary_start {
             let primary_nanos = start.elapsed().as_nanos() as u64;
-            // Re-acquire: the canary may have been promoted or aborted while the
-            // primary ran. Holding the lock across the shadow call keeps the
-            // candidate alive for its duration (promote/abort wait behind it).
+            // Only the sampled fraction takes the lock. Holding it across the
+            // shadow call keeps the candidate alive for its duration (a
+            // concurrent promote/abort waits behind it). The candidate may have
+            // been consumed between the decision and here — then it is simply
+            // `None` and we skip, having already served the live answer.
             let guard = self.canary.lock().unwrap();
             if let Some(canary) = guard.as_ref() {
                 canary.observe(name, args, &primary, primary_nanos);
+                // If this observation tripped a policy threshold, switch the
+                // sampler off so no further calls mirror a dead candidate.
+                if canary.is_aborted() {
+                    self.canary_rate.store(0, Ordering::Relaxed);
+                }
             }
         }
         primary
@@ -1292,6 +1331,7 @@ impl LiveRuntime {
             }
             let source = canary.source.clone();
             *guard = None;
+            self.canary_rate.store(0, Ordering::Relaxed);
             self.canary_active.store(false, Ordering::Release);
             source
         };
@@ -1302,6 +1342,7 @@ impl LiveRuntime {
     /// Discard the active canary without changing the live program. A no-op if
     /// none is active.
     pub fn abort_canary(&self) {
+        self.canary_rate.store(0, Ordering::Relaxed);
         self.canary_active.store(false, Ordering::Release);
         *self.canary.lock().unwrap() = None;
     }

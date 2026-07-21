@@ -1,38 +1,84 @@
 # Blaze 🔥
 
-**The first hot-reload engine that is correct by construction.**
+**The live logic runtime.** Ship a behavior change to a running production
+service in microseconds — provably safe, canaried against live traffic, instantly
+reversible. For humans, and for AI agents.
+
+> **LaunchDarkly flips booleans. Blaze swaps _functions_** — in ~500 microseconds,
+> with a proof, a canary, and an undo button. And it is how you let an AI touch
+> production logic without fear.
 
 Blaze is an embeddable, JIT-native scripting language whose headline feature is
-*sound* live reload: save a `.blaze` file and the running process updates
+*sound* live reload: change a `.blaze` file and the running process updates
 instantly, **state preserved** — and the engine *proves* how the update may be
 applied before applying it. A body-only edit hot-swaps one atomic pointer,
-lock-free, under concurrent execution. An ABI change is detected, its full
-blast radius recompiled, and the transition committed atomically so callers and
-callees can never be observed with mismatched signatures. A comment edit is
-proven to be nothing at all, and costs nothing at all.
+lock-free, under concurrent execution. An ABI change is detected, its full blast
+radius recompiled, and the transition committed atomically so callers and callees
+can never be observed with mismatched signatures. A broken save is proven bad and
+refused, last-good still serving. A comment edit is proven to be nothing at all,
+and costs nothing at all.
 
-No restarts. No guessed diffs. No silent corruption. **Reload is a theorem of
-the invalidation graph, not a trick.**
+No restarts. No guessed diffs. No silent corruption. **Every "instant", "safe",
+and "proven" below traces to a named test that attacks the guarantee from a
+second thread while it holds.**
+
+> 📽️ **Hero GIF placeholder.** The animated version of the demo below is recorded
+> deterministically from a checked-in [`vhs`](https://github.com/charmbracelet/vhs)
+> tape — [`docs/living_service.tape`](docs/living_service.tape) — with
+> `vhs docs/living_service.tape`. Once produced, drop
+> `![living service](docs/living_service.gif)` right here. Until then, the story
+> renders just as well as text:
+
+## See it: a living service under fire
+
+[`examples/living_service`](blaze-jit/examples/living_service) is an HTTP
+risk-scoring service whose scoring logic is a `.blaze` program, embedded through
+`FuncHandle`s and hot-swapped while thousands of requests per second pour through
+it. Its `--script` mode tells the whole story — over real HTTP, under live load,
+every beat asserted:
 
 ```sh
 git clone https://github.com/grloper/Blaze && cd Blaze
-cargo run -p blaze-jit --example live        # then edit blaze-jit/examples/live.blaze and save
+cargo run -p blaze-jit --release --example living_service            # watch mode: edit rules.blaze, live
+cargo run -p blaze-jit --release --example living_service -- --script  # the six-beat story, CI-asserted
 ```
 
 ```text
-  Blaze live fountain — tick 214    (edit the .blaze file; Ctrl-C quits)
-  [gen 3] Relink    radius {gravity, step_vy} in 6.9ms — state preserved
-+------------------------------------------------------------------------+
-|                       *    *   *                                       |
-|                  *   *  * *  *    *                                    |
-|               *    *   * ** * *  *    *                                |
-|                 *    * * ** * * *   *                                  |
-|                    *  * ***  * *  *                                    |
-|                        * * * *                                         |
-+------------------------------------------------------------------------+
+━━━ Blaze living-service — scripted run under load ━━━
+served 51,815 requests across 6 live edits, 0 dropped
+
+  [1] body edit → SafeSwap        radius {velocity_risk}          in 496µs   dropped 0
+  [2] broken save → Rejected      1 diagnostic; last-good serves on          dropped 0
+  [3] runaway while(1) → canary   trapped FuelExhausted; auto-aborted        dropped 0
+  [4] risky rule → canary         saw 309 divergences; promoted as SafeSwap  dropped 0
+  [5] ABI change → Relink         radius {velocity_risk, score}   in 1.08ms  dropped 0
+  [6] rollback to gen 1 → Relink  radius {..}                     in 1.28ms  dropped 0
+
+steady-state scoring latency: p50 64ns, p99 512ns
+all six guarantees asserted ✓
 ```
 
-Every particle's position survives the reload. Only the physics changed.
+Six live edits to a service under fire — a retune, a typo, a runaway, a risky
+change, an ABI change, and an undo — and **not one of 51,815 requests was
+dropped or wrongly answered.** Each beat is a theorem with a test:
+[`tests/living_service.rs`](blaze-jit/tests/living_service.rs) hammers the same
+story from four threads.
+
+And [`examples/agent_loop`](blaze-jit/examples/agent_loop.rs) runs that pipeline
+for an *autonomous editor* — propose → gate → offline-eval → canary →
+promote/abort → read metrics. Its centerpiece: a candidate that passes offline
+eval but loops forever on an input the eval set never covered is caught by the
+**canary on live traffic, before promotion.** That is the entire argument for
+letting an AI touch production logic — the blast radius of a bad idea is a shadow
+execution, not an outage.
+
+```sh
+cargo run -p blaze-jit --example agent_loop        # the agent reaches its target; every bad edit is stopped
+```
+
+There is also a purely visual demo — a terminal particle fountain whose physics
+is a hot-swapped `.blaze` file, state surviving every reload:
+`cargo run -p blaze-jit --example live` (then edit `blaze-jit/examples/live.blaze`).
 
 ## Why this doesn't exist elsewhere
 
@@ -116,15 +162,22 @@ guarantee with a test hammering it from a second thread:
 | A canary's candidate answer never reaches a caller — even under a storm of concurrent mirrored calls | `canary.rs::the_caller_never_sees_the_candidate` + `the_shield_holds_under_concurrent_traffic` |
 | A wrong / faulting / too-slow candidate auto-aborts and cannot be promoted | `canary.rs::a_diverging_candidate_auto_aborts` + `a_faulting_candidate_auto_aborts` + `a_slow_candidate_auto_aborts_on_latency` + `an_aborted_candidate_cannot_be_promoted` |
 | Promoting a validated candidate is the ordinary classified swap, seamless under load | `canary.rs::a_matching_candidate_promotes_through_the_swap_protocol` + `promote_is_seamless_under_concurrent_traffic` |
+| A canary evaluates its candidate under the live program's *own* fuel/depth budget, so a runaway candidate traps promptly on production limits | `canary.rs::a_runaway_candidate_traps_under_the_primary_fuel_budget` |
+| The canary sampler is lock-free and exact 1-in-N even under a storm of concurrent callers | `canary.rs::sampling_is_exact_one_in_n_under_concurrent_traffic` |
+| **The whole living-service story** — six live edits (body swap, broken save, runaway, risky change, ABI change, rollback) under sustained load, each classified as claimed, every generation computing the exact reference scores, and **zero dropped calls** | `living_service.rs::the_living_service_story_holds_under_load` — four threads hammer `score` through all six beats |
+| An autonomous agent's gate + offline-eval + canary pipeline keeps every bad edit out of production (the runaway is caught by the canary, never promoted; the objective is met with the fraud guardrail intact) | `agent_loop.rs::the_agent_pipeline_keeps_every_bad_edit_out_of_production` |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 106 tests
-cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
-cargo run -p blaze-jit --release --example bench_reload  # reload latency per edit class
-cargo run -p blaze-jit --release --example bench_calls   # call throughput (named vs handle)
+cargo test --workspace                                       # 110 tests
+cargo run -p blaze-jit --release --example living_service -- --script  # the living-service story, asserted
+cargo run -p blaze-jit --example agent_loop                   # the AI-agent safety pipeline, asserted
+cargo run -p blaze-jit --release --example bench_reload        # reload latency per edit class
+cargo run -p blaze-jit --release --example bench_calls         # call throughput (named vs handle)
+cargo run -p blaze-jit --release --example bench_vs_interpreter # Blaze vs an embedded interpreter (rhai)
+cargo run -p blaze-jit --release --example bench_canary         # canary overhead on the live path
 ```
 
 ## Embedding
@@ -136,7 +189,7 @@ use blaze_jit::{LiveRuntime, ScriptHost};
 let rt = LiveRuntime::new("int add(int a, int b) { return a + b; }")?;
 assert_eq!(rt.call("add", &[2, 3]), Ok(5));
 
-// Hot path: resolve once, call millions of times, lock-free (~95M calls/s/thread).
+// Hot path: resolve once, call millions of times, lock-free (~50M calls/s/thread).
 // The handle survives body hot-swaps transparently and detects ABI changes.
 let mut add = rt.handle("add")?;
 assert_eq!(rt.call_handle(&mut add, &[2, 3]), Ok(5));
@@ -227,38 +280,102 @@ reload and safety guarantees don't change as the language grows.
 
 ## Benchmarks
 
-`cargo run -p blaze-jit --release --example bench_reload` — a 40-function
-call-chain program (every function transitively depends on the edited leaf),
-median latencies, one warm process, measured on the dev container this repo
-was built in:
+All numbers below are single-run, release mode, **measured on the dev container
+this repo was built in** — a modest, shared cloud box. They vary run to run; the
+ratios and orders of magnitude are the point, and the *structural* claims (blast
+radius bounds compilation, the fast path shares nothing) survive any hardware.
+Every table has a `cargo run` you can reproduce.
+
+**Reload latency** (`bench_reload` — a 40-function call chain where every
+function transitively depends on the edited leaf; median of repeated edits):
 
 | Event | Latency |
 |---|---|
-| Full cold compile (≈ what a restart pays in compilation alone) | 3.88 ms |
-| Body edit → `SafeSwap` (radius 1 of 40) | **0.50 ms** |
-| Comment → `NoEffect` (radius 0) | 0.40 ms |
-| ABI edit → `Relink` (radius 2) | 0.65 ms |
+| Full cold compile (≈ what a restart pays in compilation alone) | 8.5 ms |
+| Body edit → `SafeSwap` (radius 1 of 40) | **0.74 ms** |
+| Comment → `NoEffect` (radius 0) | 0.54 ms |
+| ABI edit → `Relink` (radius 2) | 1.9 ms |
 
-Sub-millisecond from `reload()` to new native code answering calls — 7.8×
-faster than recompiling the program, on a 40-function toy. The structural
-point survives any hardware and grows with program size: the file is parsed
-once per edit and *compilation* cost scales with the **blast radius the graph
-proves**, not with how big the program is — and a restart also forfeits all
-state.
+Sub-millisecond from `reload()` to new native code answering calls — ~11× faster
+than recompiling the program, on a 40-function toy — and a restart also forfeits
+all state. Compilation cost scales with the **blast radius the graph proves**,
+not with program size. (In the living-service demo, a `SafeSwap` under live HTTP
+load committed in **496µs**.)
 
-`cargo run -p blaze-jit --release --example bench_calls` — call throughput for a
-trivial leaf function (dispatch cost, not compute):
+**Call throughput** (`bench_calls` — a trivial leaf, so this is dispatch cost,
+not compute):
 
 | Path | Throughput |
 |---|---|
-| `call(name)` (lock + string lookup per call) | ~28 M calls/s/thread |
-| `call_handle` (resolve once, then lock-free) | **~95 M calls/s/thread** |
-| `call_handle`, 4 threads | ~400 M calls/s (linear — no shared lock) |
+| `call(name)` (lock + string lookup per call) | ~19 M calls/s/thread |
+| `call_handle` (resolve once, then lock-free) | **~50 M calls/s/thread** |
+| `call_handle`, 4 threads | ~188 M calls/s (~94% of linear — nothing shared) |
 
 The fast path is an arity check, one atomic load (double-checked against the
 slot's arity so an ABI change is never mis-dispatched), and the indirect call —
-~19× the "5 M/s/thread" bar a rules engine needs, and it scales linearly
+~10× the "5 M/s/thread" bar a rules engine needs, and it scales near-linearly
 because nothing on it is shared.
+
+**vs. an embedded interpreter** (`bench_vs_interpreter` — the *same* branchy
+risk rule, cross-checked to agree on every input, in Blaze's native `FuncHandle`
+path vs. [`rhai`]'s compiled-AST `call_fn`):
+
+| Engine | Throughput |
+|---|---|
+| Blaze `call_handle` (native JIT) | **~49 M calls/s/thread** |
+| rhai `call_fn` (AST interpreter) | ~0.96 M calls/s/thread |
+
+**~51× the interpreter** on identical logic — and still hot-swappable, which a
+compiled `dylib` is not. That is the "swap functions, don't flip booleans" number.
+
+**Canary overhead** (`bench_canary` — what `call_canary` costs the live path, on
+a ~46 ns leaf so the deltas are visible; ns/call is the honest lens):
+
+| Mode | Overhead |
+|---|---|
+| Idle (no candidate) | +~4 ns/call (one atomic load) |
+| Shadowing 1% of calls | +~4 ns/call |
+| Shadowing 100% of calls | +~220 ns/call (a full shadow every call) |
+
+An idle canary is one atomic load. An active one adds a **lock-free** counter
+increment per call (noise for any real handler) plus a shadow on the sampled
+fraction — and because the sampler is lock-free, mirroring never serializes
+concurrent traffic. The caller always gets the live answer regardless.
+
+## Honest limits
+
+Blaze is a focused core, not a general language. What it deliberately does *not*
+do yet — so you know before you build on it:
+
+- **One file, one flat namespace.** A program is a single `.blaze` source of
+  top-level functions. No modules, no imports.
+- **Two scalar types, `int` (i64) and `float` (f64).** No strings, arrays,
+  structs, or pointers — which is also *why* a script can't corrupt or fault the
+  host: there are no memory operations to abuse. Explicit `int`↔`float`
+  conversions aren't in the language yet (a mixed-type expression is a proven
+  type error, not a silent coercion).
+- **State lives in the host, not the script.** Blaze functions are pure over
+  their scalar arguments; all persistent state is the embedder's. This is exactly
+  what makes state survive every reload — but "migrate a script-owned data
+  structure across a schema change" is therefore not something Blaze does.
+  `StateMigration` is a reserved `EditClass` for when script-owned state lands;
+  today it cannot occur.
+- **Retired code is retained, not freed.** A concurrent caller may still be
+  inside an old generation mid-swap, so old code pages stay mapped for the
+  runtime's life. The cost is bounded by (edit count × edited-function size) —
+  negligible for a dev loop or a human/CI-paced rules service, but it does grow
+  with the number of edits.
+- **An active canary re-executes each sampled call**, so mirror only logic free
+  of observable host side effects (the norm for scoring/decision functions), and
+  it adds a lock-free counter to every `call_canary` while running — noise for a
+  real handler, but real. A canary is an evaluation mode, not steady state.
+- **Watch mode is mtime polling.** The file-watching demo re-reads on
+  modification-time change (the `ScriptHost` mechanism); it is not an OS file-event
+  subscription.
+
+None of these change the reload and safety guarantees — growing the surface is
+roadmap, not architecture. Where a milestone couldn't be made sound in time it
+was cut and named here, rather than shipped hopeful.
 
 ## Status
 
@@ -280,7 +397,7 @@ because nothing on it is shared.
   would otherwise hold the dispatch lock forever now ends on its own, so a
   reload always commits
 - ✅ **`FuncHandle` fast path**: resolve a function once, then call it
-  lock-free at ~95 M calls/s/thread (scaling linearly across threads). Handles
+  lock-free at ~50 M calls/s/thread (scaling linearly across threads). Handles
   survive body hot-swaps transparently and detect ABI changes without ever
   dispatching a mismatched call
 - ✅ **`float` (f64) + a sound type system**: `int` and `float` are distinct
@@ -308,12 +425,24 @@ because nothing on it is shared.
   compared, but the caller *always* gets the live answer, so a bad candidate
   can never reach a real request. A wrong, faulting, or too-slow candidate
   auto-aborts per policy and cannot be promoted; `promote()` reinstalls a
-  healthy candidate through the ordinary classified swap (and journals it)
+  healthy candidate through the ordinary classified swap (and journals it). The
+  1-in-N sampler is lock-free, so an active canary never serializes live traffic
+- ✅ **The demo — a living service under fire**: `examples/living_service` is an
+  HTTP scoring service whose logic is a hot-swapped `.blaze` program, with a live
+  TUI (req/s, p50/p99, generation timeline, last reload, canary divergence). Its
+  `--script` mode runs the six-beat story — SafeSwap, Rejected, canary-caught
+  runaway, canary + promote, Relink, rollback — over real HTTP under load, every
+  beat asserted, zero dropped. `examples/agent_loop` runs the same
+  gate → canary → promote/abort pipeline for an autonomous editor
+- ✅ **Benchmark suite**: reload latency per class, call throughput (named vs
+  handle), Blaze vs. an embedded interpreter (`rhai`, ~51×), and canary overhead
+  — all reproducible and machine-labeled
 - 🔜 Richer types and explicit `int`↔`float` conversions (pure language growth;
   reload semantics unchanged)
 - 🔜 `StateMigration`: script-owned persistent state with layout versioning
-- 🔜 Windowed demo (the terminal demo is engine-complete; a `winit`/`macroquad`
-  frontend is presentation), editor status-line plugin, GIF for this README
+- 🔜 Windowed demo (the terminal demos are engine-complete; a `winit`/`macroquad`
+  frontend is presentation) and an editor status-line plugin. A `vhs` tape
+  (`docs/living_service.tape`) records the README GIF deterministically
 
 ## Design notes
 
