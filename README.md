@@ -18,6 +18,10 @@
 </p>
 
 <p align="center">
+  <strong>✨ <a href="https://grloper.github.io/Blaze/">View the interactive website</a></strong>
+</p>
+
+<p align="center">
   <a href="https://grloper.github.io/Blaze/"><strong>Website</strong></a> ·
   <a href="#see-it-a-living-service-under-fire">Demo</a> ·
   <a href="#why-this-doesnt-exist-elsewhere">How it’s safe</a> ·
