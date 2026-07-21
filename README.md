@@ -18,7 +18,9 @@
 </p>
 
 <p align="center">
-  <strong><a href="https://grloper.github.io/Blaze/">View the interactive website</a></strong>
+  <a href="https://grloper.github.io/Blaze/">
+    <img src="https://img.shields.io/badge/View%20the%20interactive%20website-Open%20%E2%86%92-ff6b35?style=for-the-badge&labelColor=0a0b0d" alt="View the interactive website" height="38" />
+  </a>
 </p>
 
 <p align="center">
