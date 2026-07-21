@@ -1,0 +1,33 @@
+// Blaze live demo — edit this file while `cargo run --example live` runs.
+// The running fountain updates the instant you save. Positions and
+// velocities are fixed-point integers (x1000).
+//
+// Things to try, in escalating order of magic:
+//   1. Make gravity negative               -> particles fall UP (SafeSwap)
+//   2. Add a comment anywhere              -> proven no-op   (NoEffect)
+//   3. Give gravity a parameter `int t`
+//      and pass `t` from step_vy           -> sound ABI swap (Relink)
+
+int gravity() {
+    return 55;
+}
+
+int drag(int v) {
+    return v * 992 / 1000;
+}
+
+int step_vx(int vx) {
+    return drag(vx);
+}
+
+int step_vy(int vy, int t) {
+    return drag(vy + gravity());
+}
+
+int step_x(int x, int vx) {
+    return x + vx / 30;
+}
+
+int step_y(int y, int vy) {
+    return y + vy / 30;
+}

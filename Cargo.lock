@@ -52,6 +52,7 @@ name = "blaze-ir"
 version = "0.1.0"
 dependencies = [
  "blaze-parse",
+ "rowan",
  "salsa",
 ]
 
@@ -66,6 +67,7 @@ dependencies = [
  "cranelift-jit",
  "cranelift-module",
  "cranelift-native",
+ "libc",
  "salsa",
  "target-lexicon",
 ]
