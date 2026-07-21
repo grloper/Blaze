@@ -278,6 +278,45 @@ fn a_defective_candidate_is_rejected() {
 }
 
 #[test]
+fn sampling_is_exact_one_in_n_under_concurrent_traffic() {
+    // The 1-in-N sampler is lock-free (an atomic counter off the canary's lock),
+    // so it must stay exact under a storm of concurrent callers: every call is
+    // assigned a distinct counter value, so the number sampled is deterministic
+    // no matter how the threads interleave — and the caller still never sees the
+    // candidate.
+    let rt = Arc::new(LiveRuntime::new("int score(int x) { return x + x; }\n").expect("compile"));
+    let policy = CanaryPolicy { sample_every: 4, max_divergences: u64::MAX, ..Default::default() };
+    rt.canary("int score(int x) { return x + 1; }\n", policy).expect("start");
+
+    const THREADS: u64 = 4;
+    const PER: u64 = 4000;
+    let start = Arc::new(AtomicBool::new(false));
+    let workers: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let rt = rt.clone();
+            let start = start.clone();
+            thread::spawn(move || {
+                while !start.load(Ordering::Relaxed) {
+                    std::hint::spin_loop();
+                }
+                for _ in 0..PER {
+                    assert_eq!(rt.call_canary("score", &[5]), Ok(10), "candidate answer leaked");
+                }
+            })
+        })
+        .collect();
+    start.store(true, Ordering::Relaxed);
+    for w in workers {
+        w.join().expect("worker");
+    }
+
+    // Exactly one call in four was mirrored — no double-counting, no lost sample,
+    // regardless of interleaving.
+    let total = THREADS * PER;
+    assert_eq!(rt.canary_status().unwrap().samples, total / 4, "1-in-4 must be exact under races");
+}
+
+#[test]
 fn sampling_is_one_in_n() {
     let rt = LiveRuntime::new("int score(int x) { return x + x; }\n").expect("compile");
     // Sample one call in four; never abort, so nothing stops the counting.
