@@ -64,15 +64,30 @@ extern "C" fn missing_stub(_ctx: *mut CallState) -> i64 {
 // Slot table
 // ---------------------------------------------------------------------------
 
-/// A page-aligned, `mmap`-allocated array of atomic function-pointer slots.
+/// Sentinel arity for a slot that holds no live function (never assigned, or
+/// removed by an edit). No real function has this arity, so a cached handle
+/// whose slot becomes empty always detects it.
+const ARITY_EMPTY: u64 = u64::MAX;
+
+/// A page-aligned, `mmap`-allocated array of atomic function-pointer slots,
+/// with a parallel array of the arity currently compiled into each slot.
 ///
-/// The table's address is stable for the life of the runtime — generated code
-/// bakes `&table[slot]` in as an absolute constant and performs an atomic load
-/// on every call, which is what makes pointer hot-swapping a single
-/// release-store from the reloading thread.
+/// The *code* array's address is stable for the life of the runtime — generated
+/// code bakes `&code[slot]` in as an absolute constant and performs an atomic
+/// load on every call, which is what makes pointer hot-swapping a single
+/// release-store. The *arity* array is read only by the runtime (never by
+/// generated code) and is what lets [`FuncHandle`]'s lock-free fast path detect
+/// an ABI change: a body swap leaves a slot's arity untouched (so live handles
+/// keep working and pick up the new body for free), while a relink that changes
+/// arity publishes the new arity *before* the new code, so a reader that
+/// double-checks arity around the code load can never call code with a
+/// mismatched argument count.
 struct SwapTable {
-    base: *mut AtomicU64,
+    code: *mut AtomicU64,
     bytes: usize,
+    /// Arity compiled into each slot, or [`ARITY_EMPTY`]. Boxed (not `mmap`'d):
+    /// only the runtime touches it, never generated code.
+    arity: Box<[AtomicU64]>,
 }
 
 // SAFETY: the table is a fixed allocation of atomics; all mutation goes through
@@ -84,7 +99,7 @@ impl SwapTable {
     fn new() -> Result<Self, String> {
         let bytes = TABLE_CAPACITY * std::mem::size_of::<AtomicU64>();
         // SAFETY: anonymous private mapping, checked for MAP_FAILED below.
-        let base = unsafe {
+        let code = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 bytes,
@@ -94,38 +109,62 @@ impl SwapTable {
                 0,
             )
         };
-        if base == libc::MAP_FAILED {
+        if code == libc::MAP_FAILED {
             return Err("mmap of the swap table failed".to_string());
         }
-        let table = SwapTable { base: base.cast::<AtomicU64>(), bytes };
+        let arity = (0..TABLE_CAPACITY).map(|_| AtomicU64::new(ARITY_EMPTY)).collect();
+        let table = SwapTable { code: code.cast::<AtomicU64>(), bytes, arity };
         // Every slot starts as the missing stub, so even a call emitted against
         // a never-defined function lands somewhere harmless.
         for i in 0..TABLE_CAPACITY {
-            table.slot(i).store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
+            table.code(i).store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
         }
         Ok(table)
     }
 
     #[inline]
-    fn slot(&self, index: usize) -> &AtomicU64 {
+    fn code(&self, index: usize) -> &AtomicU64 {
         assert!(index < TABLE_CAPACITY);
-        // SAFETY: `base` points at TABLE_CAPACITY zero-initialized AtomicU64s,
+        // SAFETY: `code` points at TABLE_CAPACITY zero-initialized AtomicU64s,
         // properly aligned by mmap's page alignment; index is bounds-checked.
-        unsafe { &*self.base.add(index) }
+        unsafe { &*self.code.add(index) }
     }
 
-    /// Absolute address of a slot, for baking into generated code.
     #[inline]
-    fn slot_addr(&self, index: usize) -> usize {
+    fn arity(&self, index: usize) -> &AtomicU64 {
+        &self.arity[index]
+    }
+
+    /// Absolute address of a slot's code pointer, for baking into generated code.
+    #[inline]
+    fn code_addr(&self, index: usize) -> usize {
         assert!(index < TABLE_CAPACITY);
-        self.base as usize + index * std::mem::size_of::<AtomicU64>()
+        self.code as usize + index * std::mem::size_of::<AtomicU64>()
+    }
+
+    /// Publish a function into a slot: store its arity *before* its code
+    /// (release-ordered), the order the lock-free reader in [`FuncHandle`]
+    /// relies on to never observe new code under an old arity.
+    #[inline]
+    fn publish(&self, index: usize, arity: usize, code_ptr: u64) {
+        self.arity(index).store(arity as u64, Ordering::Release);
+        self.code(index).store(code_ptr, Ordering::Release);
+    }
+
+    /// Mark a slot empty (its function was removed): arity first, then a harmless
+    /// stub. A handle to it will see [`ARITY_EMPTY`] and refresh.
+    #[inline]
+    fn clear(&self, index: usize) {
+        self.arity(index).store(ARITY_EMPTY, Ordering::Release);
+        self.code(index)
+            .store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
     }
 }
 
 impl Drop for SwapTable {
     fn drop(&mut self) {
         // SAFETY: unmapping exactly the region mapped in `new`.
-        unsafe { libc::munmap(self.base.cast(), self.bytes) };
+        unsafe { libc::munmap(self.code.cast(), self.bytes) };
     }
 }
 
@@ -155,7 +194,7 @@ impl CallEmitter for TableEmitter<'_> {
             .slots
             .get(&callee)
             .expect("slot allocated for every callee before compilation");
-        let slot_addr = self.table.slot_addr(slot_index) as i64;
+        let slot_addr = self.table.code_addr(slot_index) as i64;
 
         let addr = builder.ins().iconst(types::I64, slot_addr);
         // Acquire-load pairs with the reloader's release-store, so a caller
@@ -237,6 +276,10 @@ pub enum CallError {
     /// The call exhausted its execution budget (e.g. an infinite loop). The
     /// call was aborted deterministically; the runtime remains usable. (H3)
     FuelExhausted,
+    /// A [`FuncHandle`] could not be reconciled with the current program (its
+    /// function kept changing arity across repeated refresh attempts). Re-resolve
+    /// it with [`LiveRuntime::handle`]. Does not occur in normal use.
+    HandleStale,
 }
 
 impl std::fmt::Display for CallError {
@@ -253,11 +296,35 @@ impl std::fmt::Display for CallError {
             CallError::FuelExhausted => {
                 write!(f, "call aborted: exhausted its execution budget")
             }
+            CallError::HandleStale => {
+                write!(f, "function handle is stale; re-resolve it with `handle()`")
+            }
         }
     }
 }
 
 impl std::error::Error for CallError {}
+
+/// A resolved reference to a function, for the lock-free fast call path.
+///
+/// Obtain one with [`LiveRuntime::handle`] and invoke it with
+/// [`LiveRuntime::call_handle`]. A handle caches the function's slot and arity
+/// so a call skips the name lookup and lock the string-keyed [`LiveRuntime::call`]
+/// pays; it self-heals across hot-swaps (body edits are transparent, arity
+/// changes trigger one refresh). Cheap to clone; hold one per thread.
+#[derive(Debug, Clone)]
+pub struct FuncHandle {
+    name: String,
+    slot: usize,
+    arity: usize,
+}
+
+impl FuncHandle {
+    /// The function this handle refers to.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The runtime
@@ -394,7 +461,7 @@ impl LiveRuntime {
         // pointer, then tail-calls the real host function, so host functions
         // are invoked through the same ABI as Blaze functions.
         let trampoline = compile_host_trampoline(&mut inner.trampolines, arity, ptr);
-        self.table.slot(slot).store(trampoline as u64, Ordering::Release);
+        self.table.publish(slot, arity, trampoline as u64);
         self.dispatch
             .write()
             .unwrap()
@@ -441,24 +508,97 @@ impl LiveRuntime {
             return Err(CallError::UnsupportedArity(args.len()));
         }
 
-        let code = self.table.slot(entry.slot).load(Ordering::Acquire) as usize as *const u8;
+        let code = self.table.code(entry.slot).load(Ordering::Acquire) as usize as *const u8;
+        // SAFETY: `code` is a finalized function compiled with the
+        // context-threading `(*mut CallState, i64 × arity)` signature; the arity
+        // was checked against the dispatch table, updated atomically under the
+        // same lock held here.
+        unsafe { self.run(code, args) }
+    }
 
+    /// Allocate this call's state, invoke `code`, and translate a resource trap
+    /// into a typed error. Shared by [`Self::call`] and [`Self::call_handle`].
+    ///
+    /// # Safety
+    ///
+    /// `code` must point at a finalized function compiled with the
+    /// context-threading signature for exactly `args.len()` arguments.
+    #[inline]
+    unsafe fn run(&self, code: *const u8, args: &[i64]) -> Result<i64, CallError> {
         // Fresh per-call state on this thread's stack — automatically per-thread
         // and per-call, so concurrent callers never share counters. Depth and
         // fuel guards are both active; the fuel budget is read lock-free.
         let mut state = CallState::new(self.fuel_budget.load(Ordering::Relaxed));
-
-        // SAFETY: `code` is either the missing stub or a finalized function
-        // compiled with the context-threading `(*mut CallState, i64 × arity)`
-        // signature; the arity was checked against the dispatch table, which is
-        // updated atomically with the slots it describes.
-        let result = unsafe { abi::invoke(code, &mut state, args) };
-
+        let result = abi::invoke(code, &mut state, args);
         match state.trap as i64 {
             TRAP_STACK => Err(CallError::ResourceExhausted),
             TRAP_FUEL => Err(CallError::FuelExhausted),
             _ => Ok(result),
         }
+    }
+
+    /// Resolve `name` to a reusable [`FuncHandle`] once, so subsequent calls can
+    /// take the lock-free fast path ([`Self::call_handle`]) instead of a
+    /// name lookup under a lock every time. This is the path a hot serving loop
+    /// (thousands of calls per request, per thread) should use.
+    pub fn handle(&self, name: &str) -> Result<FuncHandle, CallError> {
+        let dispatch = self.dispatch.read().unwrap();
+        let entry = dispatch
+            .get(name)
+            .copied()
+            .ok_or_else(|| CallError::UnknownFunction(name.to_string()))?;
+        Ok(FuncHandle { name: name.to_string(), slot: entry.slot, arity: entry.arity })
+    }
+
+    /// Invoke a previously-[resolved](Self::handle) function on its lock-free
+    /// fast path: an arity check, one acquire-load of the slot's code pointer
+    /// (double-checked against the slot's arity), and the indirect call. No
+    /// lock, no name lookup.
+    ///
+    /// The handle transparently survives body hot-swaps — it keeps calling and
+    /// picks up the new code automatically. If a relink *changed the function's
+    /// arity* (or removed it) since the handle was resolved, the handle is
+    /// refreshed once against the current program; if the caller's argument
+    /// count no longer matches the new signature the call returns
+    /// [`CallError::ArityMismatch`] (never undefined behavior).
+    pub fn call_handle(&self, handle: &mut FuncHandle, args: &[i64]) -> Result<i64, CallError> {
+        if args.len() > MAX_ARITY {
+            return Err(CallError::UnsupportedArity(args.len()));
+        }
+        // Bounded retry: a refresh re-reads the current program once; more than a
+        // couple of iterations would require relinks racing every attempt, which
+        // does not happen in practice (relinks are rare, human/CI-paced events).
+        for _ in 0..8 {
+            // Double-check the slot's arity around the code load. Because a
+            // relink publishes arity *before* code (see `SwapTable::publish`),
+            // observing the *handle's* arity both before and after the code load
+            // guarantees the code we call was compiled for exactly that arity.
+            let a1 = self.table.arity(handle.slot).load(Ordering::Acquire);
+            if a1 == handle.arity as u64 {
+                // The handle is current for its slot. Now validate the caller's
+                // argument count against it — checking this *after* confirming
+                // the handle isn't stale, so a caller adapting to a new arity
+                // isn't rejected against an outdated cached arity.
+                if args.len() != handle.arity {
+                    return Err(CallError::ArityMismatch {
+                        name: handle.name.clone(),
+                        expected: handle.arity,
+                        got: args.len(),
+                    });
+                }
+                let code = self.table.code(handle.slot).load(Ordering::Acquire) as usize as *const u8;
+                let a2 = self.table.arity(handle.slot).load(Ordering::Acquire);
+                if a2 == handle.arity as u64 {
+                    // SAFETY: `code` is finalized code compiled for exactly
+                    // `handle.arity` arguments, which equals `args.len()`.
+                    return unsafe { self.run(code, args) };
+                }
+            }
+            // The slot's arity differs from the handle (a relink changed the
+            // function's ABI, or removed it) — refresh once and retry.
+            *handle = self.handle(&handle.name)?;
+        }
+        Err(CallError::HandleStale)
     }
 
     /// Number of completed generations (0 after `new`, +1 per effective reload).
@@ -668,32 +808,38 @@ impl LiveRuntime {
             && !is_initial;
         let commit = |dispatch: &mut HashMap<String, DispatchEntry>| {
             for (name, slot, func_id) in &compiled {
-                let code = module.get_finalized_function(*func_id);
-                self.table.slot(*slot).store(code as u64, Ordering::Release);
                 let arity = current
                     .iter()
                     .find(|(n, _)| n == name)
                     .map(|(_, node)| node.signature.arity())
                     .unwrap_or(0);
+                let code = module.get_finalized_function(*func_id);
+                // Arity before code — the ordering the lock-free handle path relies on.
+                self.table.publish(*slot, arity, code as u64);
                 dispatch.insert(name.clone(), DispatchEntry { slot: *slot, arity });
             }
             for name in &removed {
                 let id = blaze_ir::function_id(&inner.db, name);
                 if let Some(&slot) = inner.slots.get(&id) {
-                    self.table
-                        .slot(slot)
-                        .store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
+                    self.table.clear(slot);
                 }
                 dispatch.remove(name);
             }
         };
 
         if lock_free {
-            // The dispatch map itself is untouched (same name, same slot, same
-            // arity) — only the slot's pointer moves, atomically.
-            for (_, slot, func_id) in &compiled {
+            // A single body-only edit: arity is unchanged, so the dispatch map
+            // and the slot's published arity both stay put — only the code
+            // pointer moves, atomically. Live handles keep working and pick up
+            // the new body on their next call for free.
+            for (name, slot, func_id) in &compiled {
+                let arity = current
+                    .iter()
+                    .find(|(n, _)| n == name)
+                    .map(|(_, node)| node.signature.arity())
+                    .unwrap_or(0);
                 let code = module.get_finalized_function(*func_id);
-                self.table.slot(*slot).store(code as u64, Ordering::Release);
+                self.table.publish(*slot, arity, code as u64);
             }
         } else {
             let mut dispatch = self.dispatch.write().unwrap();

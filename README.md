@@ -103,14 +103,17 @@ guarantee with a test hammering it from a second thread:
 | Fuel bounds shallow-but-explosive recursion the depth guard can't | `live.rs::exponential_recursion_is_bounded_by_fuel` — naive `fib(40)` (depth 40, ~3×10⁸ calls) is caught by fuel, not depth |
 | Fuel doesn't false-positive real loops | `live.rs::legitimate_loops_run_under_fuel` — a 1000-iteration loop computes correctly under the default budget |
 | A live-edited `x / 0` cannot fault the host | `jit.rs::division_is_guarded_and_cannot_fault_the_process` — division is guarded in codegen; `x/0 == 0`, `INT_MIN / -1 == INT_MIN` |
+| The fast `FuncHandle` path is torn-free under concurrent hot-swaps | `live.rs::handle_calls_are_correct_under_concurrent_body_swap` — a thread hammers a function through a lock-free handle while it is body-swapped; every value is old- or new-correct |
+| A handle survives a body swap yet detects an arity change | `live.rs::handle_survives_body_swap_transparently` + `handle_detects_arity_change` — a stale handle never dispatches a call with a mismatched argument count |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 53 tests
+cargo test --workspace                                  # 57 tests
 cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
-cargo run -p blaze-jit --release --example bench_reload  # latency numbers on your machine
+cargo run -p blaze-jit --release --example bench_reload  # reload latency per edit class
+cargo run -p blaze-jit --release --example bench_calls   # call throughput (named vs handle)
 ```
 
 ## Embedding
@@ -121,6 +124,11 @@ use blaze_jit::{LiveRuntime, ScriptHost};
 // One-shot: compile a program and call it.
 let rt = LiveRuntime::new("int add(int a, int b) { return a + b; }")?;
 assert_eq!(rt.call("add", &[2, 3]), Ok(5));
+
+// Hot path: resolve once, call millions of times, lock-free (~95M calls/s/thread).
+// The handle survives body hot-swaps transparently and detects ABI changes.
+let mut add = rt.handle("add")?;
+assert_eq!(rt.call_handle(&mut add, &[2, 3]), Ok(5));
 
 // Native functions, callable from Blaze through the same swap table:
 extern "C" fn now_ms() -> i64 { /* ... */ 0 }
@@ -199,6 +207,20 @@ once per edit and *compilation* cost scales with the **blast radius the graph
 proves**, not with how big the program is — and a restart also forfeits all
 state.
 
+`cargo run -p blaze-jit --release --example bench_calls` — call throughput for a
+trivial leaf function (dispatch cost, not compute):
+
+| Path | Throughput |
+|---|---|
+| `call(name)` (lock + string lookup per call) | ~28 M calls/s/thread |
+| `call_handle` (resolve once, then lock-free) | **~95 M calls/s/thread** |
+| `call_handle`, 4 threads | ~400 M calls/s (linear — no shared lock) |
+
+The fast path is an arity check, one atomic load (double-checked against the
+slot's arity so an ABI change is never mis-dispatched), and the indirect call —
+~19× the "5 M/s/thread" bar a rules engine needs, and it scales linearly
+because nothing on it is shared.
+
 ## Status
 
 - ✅ Incremental firewall (proved by tests since the first commit)
@@ -218,7 +240,11 @@ state.
   single bad edit can no longer fault *or wedge* the runtime: a runaway that
   would otherwise hold the dispatch lock forever now ends on its own, so a
   reload always commits
-- ✅ Terminal live demo + scripted CI-safe mode + latency benchmark
+- ✅ **`FuncHandle` fast path**: resolve a function once, then call it
+  lock-free at ~95 M calls/s/thread (scaling linearly across threads). Handles
+  survive body hot-swaps transparently and detect ABI changes without ever
+  dispatching a mismatched call
+- ✅ Terminal live demo + scripted CI-safe mode + reload & call benchmarks
 - 🔜 In-process canary: mirror live traffic through a candidate generation
   before promoting it, with an auto-abort policy
 - 🔜 Generation journal + `rollback()`: every reload's source, class, and

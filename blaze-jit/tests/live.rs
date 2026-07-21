@@ -22,6 +22,10 @@
 //! | A runaway can't permanently block a reload (the un-wedge)     | [`relink_commits_after_a_runaway_loop_traps`] |
 //! | Fuel bounds shallow-but-explosive recursion depth can't       | [`exponential_recursion_is_bounded_by_fuel`] |
 //! | Fuel doesn't false-positive real loops; can be disabled       | [`legitimate_loops_run_under_fuel`] |
+//! | A `FuncHandle` fast call matches the named call                | [`handle_calls_match_named_calls`] |
+//! | A handle transparently survives a body hot-swap               | [`handle_survives_body_swap_transparently`] |
+//! | A handle detects an arity change, never calls with wrong arity | [`handle_detects_arity_change`] |
+//! | Handle fast path is torn-free under concurrent body swaps      | [`handle_calls_are_correct_under_concurrent_body_swap`] |
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -618,4 +622,118 @@ int sum_to(int n) {
     // Explicitly disabling fuel leaves the same call correct.
     runtime.set_fuel_budget(u64::MAX);
     assert_eq!(runtime.call("sum_to", &[1000]), Ok(499_500));
+}
+
+// --- H5: the FuncHandle fast path ------------------------------------------
+//
+// `call(name, ..)` pays a lock + a string-keyed lookup every invocation —
+// fine for a demo, too slow for a rules engine at 100k+ calls/s. `handle()`
+// resolves a function once; `call_handle()` is then a lock-free arity check +
+// one atomic load + the indirect call, while still self-healing across
+// hot-swaps: a body edit is transparent, an arity change is detected and never
+// dispatched with a mismatched argument count.
+
+#[test]
+fn handle_calls_match_named_calls() {
+    let runtime = LiveRuntime::new(V1).expect("compile");
+    let mut add = runtime.handle("add").expect("resolve add");
+    let mut main = runtime.handle("main").expect("resolve main");
+
+    assert_eq!(runtime.call_handle(&mut add, &[2, 3]), Ok(5));
+    assert_eq!(runtime.call_handle(&mut add, &[10, 20]), Ok(30));
+    assert_eq!(runtime.call_handle(&mut main, &[]), runtime.call("main", &[]));
+
+    // A wrong argument count on a valid handle is a defined error, not UB.
+    assert!(matches!(
+        runtime.call_handle(&mut add, &[1]),
+        Err(CallError::ArityMismatch { expected: 2, got: 1, .. })
+    ));
+
+    // Resolving a name that doesn't exist fails up front.
+    assert_eq!(runtime.handle("nope").err(), Some(CallError::UnknownFunction("nope".into())));
+}
+
+#[test]
+fn handle_survives_body_swap_transparently() {
+    let runtime = LiveRuntime::new(V1).expect("compile");
+    // Resolve once, *before* the edit.
+    let mut add = runtime.handle("add").expect("resolve add");
+    assert_eq!(runtime.call_handle(&mut add, &[1, 2]), Ok(3));
+
+    // Body-only edit: `add` becomes `a + a + b`. Same handle, no re-resolve.
+    let report = runtime.reload(V2_BODY_ONLY).expect("reload");
+    assert_eq!(report.class, EditClass::SafeSwap);
+
+    // The very same handle now yields the new behavior — it picked up the
+    // hot-swapped code through the slot's atomic pointer, with no refresh.
+    assert_eq!(runtime.call_handle(&mut add, &[1, 2]), Ok(4));
+    assert_eq!(runtime.call_handle(&mut add, &[10, 20]), Ok(40));
+}
+
+#[test]
+fn handle_detects_arity_change() {
+    // `add` here is standalone (nothing calls it), so changing its arity is a
+    // clean relink of just `add`.
+    let src = "int add(int a, int b) { return a + b; }\n";
+    let runtime = LiveRuntime::new(src).expect("compile");
+    let mut add = runtime.handle("add").expect("resolve add");
+    assert_eq!(runtime.call_handle(&mut add, &[2, 3]), Ok(5));
+
+    // Relink `add` to take three arguments.
+    let report = runtime
+        .reload("int add(int a, int b, int c) { return a + b + c; }\n")
+        .expect("reload");
+    assert_eq!(report.class, EditClass::Relink);
+
+    // The stale handle must NOT dispatch a 2-arg call into 3-arg code: it
+    // refreshes, sees the new arity, and reports the caller's mismatch.
+    assert!(matches!(
+        runtime.call_handle(&mut add, &[2, 3]),
+        Err(CallError::ArityMismatch { expected: 3, got: 2, .. })
+    ));
+    // A caller that adapts to the new 3-arg signature works through the same
+    // handle (it self-refreshed to arity 3).
+    assert_eq!(runtime.call_handle(&mut add, &[2, 3, 4]), Ok(9));
+}
+
+#[test]
+fn handle_calls_are_correct_under_concurrent_body_swap() {
+    let runtime = Arc::new(LiveRuntime::new(V1).expect("compile"));
+    assert_eq!(runtime.call("main", &[]), Ok(3));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    // Worker hammers `main` through a per-thread handle on the fast path.
+    let worker = {
+        let runtime = runtime.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            let mut h = runtime.handle("main").expect("resolve main");
+            let mut seen = Vec::new();
+            while !stop.load(Ordering::Relaxed) {
+                match runtime.call_handle(&mut h, &[]) {
+                    Ok(v) => seen.push(v),
+                    Err(e) => panic!("fast-path call failed mid-swap: {e}"),
+                }
+            }
+            seen
+        })
+    };
+
+    thread::sleep(Duration::from_millis(50));
+    // Body-swap `add` under the hammer (main returns add(1,2): 3 -> 4).
+    runtime.reload(V2_BODY_ONLY).expect("reload");
+    wait_for_value(&runtime, 4);
+    thread::sleep(Duration::from_millis(30));
+    stop.store(true, Ordering::Relaxed);
+
+    let seen = worker.join().expect("fast-path worker must never panic");
+    assert!(!seen.is_empty());
+    // Same soundness theorem as the locked path: every value is old-correct or
+    // new-correct, never torn — proven for the lock-free handle path too.
+    assert!(
+        seen.iter().all(|v| *v == 3 || *v == 4),
+        "torn value on the handle fast path: {:?}",
+        seen.iter().find(|v| **v != 3 && **v != 4),
+    );
+    assert_eq!(runtime.call("main", &[]), Ok(4));
 }
