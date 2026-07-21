@@ -34,6 +34,27 @@
 
 ---
 
+<h2 align="center">▶&nbsp; Watch it in action</h2>
+
+<p align="center">
+  <strong>Every other tool makes you redeploy. Blaze rewrites live code <em>mid&#8209;request</em> —<br />
+  and refuses anything unsafe before a single user ever feels it.</strong><br />
+  <sub>10 seconds. One running server. Zero downtime, zero dropped calls.</sub>
+</p>
+
+<div align="center">
+  <video src="https://github.com/grloper/Blaze/raw/main/docs/assets/blaze-demo.mp4" poster="docs/assets/blaze-demo-poster.png" controls muted playsinline width="760">
+    <a href="https://github.com/grloper/Blaze/raw/main/docs/assets/blaze-demo.mp4"><img src="docs/assets/blaze-demo-poster.png" width="760" alt="Blaze demo — swap a live function, reject a broken edit, roll back in one call" /></a>
+  </video>
+</div>
+
+<p align="center">
+  <em>Swap a live function in&nbsp;~500µs&nbsp; ·&nbsp; reject broken edits automatically&nbsp; ·&nbsp; canary on live traffic&nbsp; ·&nbsp; undo in one call.</em><br />
+  <sub>▶ Video not playing? <a href="https://github.com/grloper/Blaze/raw/main/docs/assets/blaze-demo.mp4">Open it directly</a> or <a href="https://grloper.github.io/Blaze/">watch the full story on the website</a>.</sub>
+</p>
+
+---
+
 > **LaunchDarkly flips booleans. Blaze swaps _functions_** — in ~500&nbsp;microseconds,
 > with a proof, a canary, and an undo button. And it is how you let an AI touch
 > production logic without fear.
