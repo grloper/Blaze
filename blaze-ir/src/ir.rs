@@ -23,12 +23,16 @@ use std::collections::BTreeSet;
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct FunctionId(pub u32);
 
-/// The Blaze type lattice. Only `int` (a machine `i64`) exists today; the enum
-/// is the extension point for the pointer and aggregate types the grammar
-/// already reserves tokens for.
+/// The Blaze scalar type lattice: a machine `i64` or an IEEE-754 `f64`.
+///
+/// Because [`Type`] is part of [`Signature`], the firewall's `Relink`
+/// classification now distinguishes e.g. `(int) -> int` from `(float) -> int`:
+/// changing a parameter's type is an ABI change that correctly cascades to
+/// callers, exactly like changing its arity.
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 pub enum Type {
     Int,
+    Float,
 }
 
 /// A function's ABI: parameter types (in order) and return type.
@@ -81,23 +85,41 @@ pub enum CmpKind {
 /// lowering guarantees every block is closed by exactly one `Jump`, `Branch`,
 /// or `Return` before the next `Label` (or end of body). Backends may rely on
 /// that invariant.
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+///
+/// `Eq`/`Hash` are intentionally *not* derived: [`IrOp::LoadFloat`] carries an
+/// `f64`, and bit-exact `PartialEq` (which is what the firewall's backdating
+/// comparison uses) is the right and sufficient equality — two identical
+/// programs still lower to `PartialEq`-equal bodies.
+#[derive(Clone, Debug, PartialEq)]
 pub enum IrOp {
-    /// `dst = <imm>`
+    /// `dst = <int imm>`
     LoadInt(u32, i64),
-    /// `dst = lhs + rhs`
+    /// `dst = <float imm>`
+    LoadFloat(u32, f64),
+    /// `dst = lhs + rhs` (integer)
     Add(u32, u32, u32),
-    /// `dst = lhs - rhs`
+    /// `dst = lhs - rhs` (integer)
     Sub(u32, u32, u32),
-    /// `dst = lhs * rhs`
+    /// `dst = lhs * rhs` (integer)
     Mul(u32, u32, u32),
-    /// `dst = lhs / rhs` — **guarded**: `x / 0 == 0` and `INT_MIN / -1 ==
-    /// INT_MIN`, so no live-edited program can fault the host process on a
-    /// division. The backend emits the guards.
+    /// `dst = lhs / rhs` (integer) — **guarded**: `x / 0 == 0` and
+    /// `INT_MIN / -1 == INT_MIN`, so no live-edited program can fault the host
+    /// process on a division. The backend emits the guards.
     Div(u32, u32, u32),
-    /// `dst = (lhs <op> rhs) ? 1 : 0`
+    /// `dst = lhs + rhs` (float)
+    FAdd(u32, u32, u32),
+    /// `dst = lhs - rhs` (float)
+    FSub(u32, u32, u32),
+    /// `dst = lhs * rhs` (float)
+    FMul(u32, u32, u32),
+    /// `dst = lhs / rhs` (float) — IEEE division never traps (`x/0.0` is ±inf/NaN).
+    FDiv(u32, u32, u32),
+    /// `dst = (lhs <op> rhs) ? 1 : 0` (integer comparison; result is `int`)
     Cmp(CmpKind, u32, u32, u32),
-    /// `dst = src` (assignment into a variable's dedicated register)
+    /// `dst = (lhs <op> rhs) ? 1 : 0` (float comparison; result is `int`)
+    FCmp(CmpKind, u32, u32, u32),
+    /// `dst = src` (assignment into a variable's dedicated register; the two
+    /// registers share a type)
     Copy(u32, u32),
     /// `dst = callee(args...)`
     Call(u32, FunctionId, Vec<u32>),
@@ -111,15 +133,20 @@ pub enum IrOp {
     Label(u32),
 }
 
-/// The lowered form of one source function: its ABI, its SSA body, and the set
-/// of callees it depends on (used to route invalidation and, later, JIT linking).
-#[derive(Clone, Debug, Hash, Eq, PartialEq)]
+/// The lowered form of one source function: its ABI, its SSA body, the type of
+/// each virtual register, and the set of callees it depends on (used to route
+/// invalidation and JIT linking).
+#[derive(Clone, Debug, PartialEq)]
 pub struct FunctionNode {
     pub id: FunctionId,
     pub signature: Signature,
     pub body: Vec<IrOp>,
+    /// The type of each virtual register, indexed by register number. The
+    /// backend reads this to allocate `i64` vs `f64` machine values and to
+    /// bit-cast at call/return boundaries.
+    pub reg_types: Vec<Type>,
     /// Callees referenced by this body, de-duplicated and sorted for a stable
-    /// hash. An empty vector means the function is a leaf.
+    /// order. An empty vector means the function is a leaf.
     pub dependencies: Vec<FunctionId>,
 }
 
@@ -127,39 +154,19 @@ impl FunctionNode {
     /// A well-formed but empty node for a function that failed to parse. Keeps
     /// downstream queries total rather than optional.
     pub fn empty(id: FunctionId) -> Self {
-        FunctionNode { id, signature: Signature::default(), body: Vec::new(), dependencies: Vec::new() }
+        FunctionNode {
+            id,
+            signature: Signature::default(),
+            body: Vec::new(),
+            reg_types: Vec::new(),
+            dependencies: Vec::new(),
+        }
     }
 
-    /// The number of distinct virtual registers the body defines or references.
+    /// The number of virtual registers the body uses. Every register is
+    /// allocated with a type, so this is exactly `reg_types.len()`.
     pub fn register_count(&self) -> usize {
-        let mut max = None::<u32>;
-        let mut note = |r: u32| max = Some(max.map_or(r, |m| m.max(r)));
-        for op in &self.body {
-            match op {
-                IrOp::LoadInt(d, _) => note(*d),
-                IrOp::Add(d, a, b)
-                | IrOp::Sub(d, a, b)
-                | IrOp::Mul(d, a, b)
-                | IrOp::Div(d, a, b)
-                | IrOp::Cmp(_, d, a, b) => {
-                    note(*d);
-                    note(*a);
-                    note(*b);
-                }
-                IrOp::Copy(d, s) => {
-                    note(*d);
-                    note(*s);
-                }
-                IrOp::Call(d, _, args) => {
-                    note(*d);
-                    args.iter().for_each(|a| note(*a));
-                }
-                IrOp::Return(v) => note(*v),
-                IrOp::Branch(c, _, _) => note(*c),
-                IrOp::Jump(_) | IrOp::Label(_) => {}
-            }
-        }
-        max.map_or(0, |m| m as usize + 1)
+        self.reg_types.len()
     }
 
     /// The number of labels (basic-block openers) in the body.
@@ -181,22 +188,29 @@ impl FunctionNode {
 }
 
 /// Accumulates DevIR operations while lowering an AST body. Kept in this module
-/// so the register-allocation discipline lives next to the IR it produces.
+/// so the register-allocation and typing discipline lives next to the IR it
+/// produces. Every register is allocated with a type, recorded in `reg_types`.
 #[derive(Debug, Default)]
 pub struct IrBuilder {
-    next_reg: u32,
     next_label: u32,
+    reg_types: Vec<Type>,
     ops: Vec<IrOp>,
     deps: BTreeSet<FunctionId>,
 }
 
 impl IrBuilder {
-    /// Allocate a fresh, never-before-used virtual register.
+    /// Allocate a fresh register of type `ty`.
     #[inline]
-    pub fn fresh(&mut self) -> u32 {
-        let r = self.next_reg;
-        self.next_reg += 1;
+    pub fn alloc(&mut self, ty: Type) -> u32 {
+        let r = self.reg_types.len() as u32;
+        self.reg_types.push(ty);
         r
+    }
+
+    /// The type of an already-allocated register.
+    #[inline]
+    pub fn reg_type(&self, reg: u32) -> Type {
+        self.reg_types[reg as usize]
     }
 
     /// Allocate a fresh label. Bind it later with [`Self::bind_label`].
@@ -208,48 +222,54 @@ impl IrBuilder {
     }
 
     pub fn load_int(&mut self, value: i64) -> u32 {
-        let dst = self.fresh();
+        let dst = self.alloc(Type::Int);
         self.ops.push(IrOp::LoadInt(dst, value));
         dst
     }
 
-    pub fn add(&mut self, lhs: u32, rhs: u32) -> u32 {
-        let dst = self.fresh();
-        self.ops.push(IrOp::Add(dst, lhs, rhs));
+    pub fn load_float(&mut self, value: f64) -> u32 {
+        let dst = self.alloc(Type::Float);
+        self.ops.push(IrOp::LoadFloat(dst, value));
         dst
     }
 
-    pub fn sub(&mut self, lhs: u32, rhs: u32) -> u32 {
-        let dst = self.fresh();
-        self.ops.push(IrOp::Sub(dst, lhs, rhs));
+    /// Emit an integer arithmetic op of the given kind.
+    pub fn int_arith(&mut self, op: fn(u32, u32, u32) -> IrOp, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.alloc(Type::Int);
+        self.ops.push(op(dst, lhs, rhs));
         dst
     }
 
-    pub fn mul(&mut self, lhs: u32, rhs: u32) -> u32 {
-        let dst = self.fresh();
-        self.ops.push(IrOp::Mul(dst, lhs, rhs));
+    /// Emit a float arithmetic op of the given kind.
+    pub fn float_arith(&mut self, op: fn(u32, u32, u32) -> IrOp, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.alloc(Type::Float);
+        self.ops.push(op(dst, lhs, rhs));
         dst
     }
 
-    pub fn div(&mut self, lhs: u32, rhs: u32) -> u32 {
-        let dst = self.fresh();
-        self.ops.push(IrOp::Div(dst, lhs, rhs));
-        dst
-    }
-
+    /// Integer comparison; result is an `int` boolean (0/1).
     pub fn cmp(&mut self, kind: CmpKind, lhs: u32, rhs: u32) -> u32 {
-        let dst = self.fresh();
+        let dst = self.alloc(Type::Int);
         self.ops.push(IrOp::Cmp(kind, dst, lhs, rhs));
         dst
     }
 
-    /// Assignment into an existing register (a variable's dedicated slot).
+    /// Float comparison; result is an `int` boolean (0/1).
+    pub fn fcmp(&mut self, kind: CmpKind, lhs: u32, rhs: u32) -> u32 {
+        let dst = self.alloc(Type::Int);
+        self.ops.push(IrOp::FCmp(kind, dst, lhs, rhs));
+        dst
+    }
+
+    /// Assignment into an existing register (a variable's dedicated slot). The
+    /// two registers must already share a type.
     pub fn copy(&mut self, dst: u32, src: u32) {
         self.ops.push(IrOp::Copy(dst, src));
     }
 
-    pub fn call(&mut self, callee: FunctionId, args: Vec<u32>) -> u32 {
-        let dst = self.fresh();
+    /// Call `callee`, whose result has type `ret`.
+    pub fn call(&mut self, callee: FunctionId, args: Vec<u32>, ret: Type) -> u32 {
+        let dst = self.alloc(ret);
         self.deps.insert(callee);
         self.ops.push(IrOp::Call(dst, callee, args));
         dst
@@ -272,12 +292,13 @@ impl IrBuilder {
         self.ops.push(IrOp::Label(label));
     }
 
-    /// Finish building, sealing the ops and dependency set into a node.
+    /// Finish building, sealing the ops, register types, and dependency set.
     pub fn finish(self, id: FunctionId, signature: Signature) -> FunctionNode {
         FunctionNode {
             id,
             signature,
             body: self.ops,
+            reg_types: self.reg_types,
             dependencies: self.deps.into_iter().collect(),
         }
     }
@@ -292,10 +313,22 @@ mod tests {
         let mut b = IrBuilder::default();
         let a = b.load_int(1);
         let c = b.load_int(2);
-        let s = b.add(a, c);
+        let s = b.int_arith(IrOp::Add, a, c);
         b.ret(s);
         let node = b.finish(FunctionId(0), Signature::default());
         assert_eq!(node.register_count(), 3);
+        assert_eq!(node.reg_types, vec![Type::Int, Type::Int, Type::Int]);
         assert_eq!(node.body.last(), Some(&IrOp::Return(2)));
+    }
+
+    #[test]
+    fn float_registers_are_typed() {
+        let mut b = IrBuilder::default();
+        let x = b.load_float(1.5);
+        let y = b.load_float(2.0);
+        let s = b.float_arith(IrOp::FAdd, x, y);
+        b.ret(s);
+        let node = b.finish(FunctionId(0), Signature::default());
+        assert_eq!(node.reg_types, vec![Type::Float, Type::Float, Type::Float]);
     }
 }

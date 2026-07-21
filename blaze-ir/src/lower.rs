@@ -27,10 +27,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use blaze_parse::ast::{BinOp, Block, CallExpr, ElseArm, Expr, Function, SourceFile, Stmt};
+use blaze_parse::ast::{BinExpr, BinOp, Block, CallExpr, ElseArm, Expr, Function, Lit, SourceFile, Stmt};
 
 use crate::db::{function_id, BlazeDatabase, FnKey, SourceProgram};
-use crate::ir::{CmpKind, FunctionNode, IrBuilder, Signature, Type};
+use crate::ir::{CmpKind, FunctionNode, IrBuilder, IrOp, Signature, Type};
 
 /// The lossless green tree of the whole file — parsed **once per revision**.
 ///
@@ -94,8 +94,19 @@ pub fn function_signature<'db>(
     db.record_exec(format!("function_signature({name})"));
     let text = function_text(db, src, key);
     parse_single(text)
-        .map(|f| Signature { params: vec![Type::Int; f.params().len()], ret: Type::Int })
+        .map(|f| Signature {
+            params: f.param_decls().iter().map(|(_, ty)| lower_ty(*ty)).collect(),
+            ret: lower_ty(f.return_type()),
+        })
         .unwrap_or_default()
+}
+
+/// Map a surface [`blaze_parse::Ty`] to a DevIR [`Type`].
+fn lower_ty(ty: blaze_parse::Ty) -> Type {
+    match ty {
+        blaze_parse::Ty::Int => Type::Int,
+        blaze_parse::Ty::Float => Type::Float,
+    }
 }
 
 /// The lowered DevIR node for function `key`.
@@ -137,25 +148,51 @@ struct Lowerer<'db> {
 impl<'db> Lowerer<'db> {
     fn lower_function(&self, func: &Function, name: &str, signature: Signature) -> FunctionNode {
         let mut builder = IrBuilder::default();
-        // Parameters occupy the first registers, in declaration order.
+        // Parameters occupy the first registers, in declaration order, each
+        // allocated with its declared type.
         let mut env: HashMap<String, u32> = HashMap::new();
-        for param in func.params() {
-            let reg = builder.fresh();
-            env.insert(param, reg);
+        for (pname, pty) in func.param_decls() {
+            let reg = builder.alloc(lower_ty(pty));
+            env.insert(pname, reg);
         }
+        let ret_ty = signature.ret;
 
         let terminated = match func.body() {
             Some(block) => self.lower_block(&mut builder, &mut env, &block),
             None => false,
         };
-        // A function that falls off the end returns 0 (the C-subset has no
-        // `void`), keeping every DevIR body properly terminated.
+        // A function that falls off the end returns a zero of its declared
+        // return type (the C-subset has no `void`), keeping every DevIR body
+        // properly terminated with an ABI-correct value.
         if !terminated {
-            let zero = builder.load_int(0);
+            let zero = self.zero_of(&mut builder, ret_ty);
             builder.ret(zero);
         }
 
         builder.finish(function_id(self.db, name), signature)
+    }
+
+    /// A zero constant of the given type.
+    fn zero_of(&self, b: &mut IrBuilder, ty: Type) -> u32 {
+        match ty {
+            Type::Int => b.load_int(0),
+            Type::Float => b.load_float(0.0),
+        }
+    }
+
+    /// Return `reg` if it already has type `ty`; otherwise materialize a
+    /// register of type `ty` holding `reg`'s value. Only well-typed programs
+    /// avoid coercion entirely; a mismatch here is a diagnostic-rejected program
+    /// (the coercion just keeps lowering total and the backend panic-free — the
+    /// bit reinterpretation the backend performs is never observed live).
+    fn coerce(&self, b: &mut IrBuilder, reg: u32, ty: Type) -> u32 {
+        if b.reg_type(reg) == ty {
+            reg
+        } else {
+            let dst = b.alloc(ty);
+            b.copy(dst, reg);
+            dst
+        }
     }
 
     /// Lower every statement of `block`. Returns `true` if the block
@@ -177,10 +214,11 @@ impl<'db> Lowerer<'db> {
             Stmt::Let(let_stmt) => {
                 let value = self.lower_opt(b, env, let_stmt.value());
                 if let Some(name) = let_stmt.name() {
-                    // Each named local owns a dedicated register so later
-                    // assignments (possibly across control-flow joins) are
-                    // plain `Copy`s into a stable slot.
-                    let slot = b.fresh();
+                    // Each named local owns a dedicated register (so later
+                    // assignments across control-flow joins are plain `Copy`s)
+                    // typed by its initializer.
+                    let ty = b.reg_type(value);
+                    let slot = b.alloc(ty);
                     b.copy(slot, value);
                     env.insert(name, slot);
                 }
@@ -189,8 +227,21 @@ impl<'db> Lowerer<'db> {
             Stmt::Assign(assign) => {
                 let value = self.lower_opt(b, env, assign.value());
                 if let Some(name) = assign.name() {
-                    let slot = *env.entry(name).or_insert_with(|| b.fresh());
-                    b.copy(slot, value);
+                    match env.get(&name) {
+                        // Assign into the variable's existing, fixed-type slot.
+                        Some(&slot) => {
+                            let coerced = self.coerce(b, value, b.reg_type(slot));
+                            b.copy(slot, coerced);
+                        }
+                        // Assignment to a never-declared name: allocate a slot of
+                        // the value's type. (This is a diagnostic-rejected case.)
+                        None => {
+                            let ty = b.reg_type(value);
+                            let slot = b.alloc(ty);
+                            b.copy(slot, value);
+                            env.insert(name, slot);
+                        }
+                    }
                 }
                 false
             }
@@ -200,7 +251,7 @@ impl<'db> Lowerer<'db> {
                 true
             }
             Stmt::If(if_stmt) => {
-                let cond = self.lower_opt(b, env, if_stmt.condition());
+                let cond = self.lower_cond(b, env, if_stmt.condition());
                 let l_then = b.fresh_label();
                 let l_end = b.fresh_label();
 
@@ -262,7 +313,7 @@ impl<'db> Lowerer<'db> {
 
                 b.jump(l_head);
                 b.bind_label(l_head);
-                let cond = self.lower_opt(b, env, while_stmt.condition());
+                let cond = self.lower_cond(b, env, while_stmt.condition());
                 b.branch(cond, l_body, l_end);
 
                 b.bind_label(l_body);
@@ -288,6 +339,13 @@ impl<'db> Lowerer<'db> {
         }
     }
 
+    /// Lower a condition expression, coercing it to `int` (the branch tests
+    /// `cond != 0`). Well-typed conditions are already `int` comparisons.
+    fn lower_cond(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, cond: Option<Expr>) -> u32 {
+        let c = self.lower_opt(b, env, cond);
+        self.coerce(b, c, Type::Int)
+    }
+
     /// Lower an optional expression, materializing a `0` when absent so the IR
     /// stays total on malformed input.
     fn lower_opt(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, expr: Option<Expr>) -> u32 {
@@ -299,7 +357,11 @@ impl<'db> Lowerer<'db> {
 
     fn lower_expr(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, expr: &Expr) -> u32 {
         match expr {
-            Expr::Literal(lit) => b.load_int(lit.value().unwrap_or(0)),
+            Expr::Literal(lit) => match lit.literal() {
+                Some(Lit::Int(v)) => b.load_int(v),
+                Some(Lit::Float(v)) => b.load_float(v),
+                None => b.load_int(0),
+            },
             Expr::NameRef(name_ref) => {
                 let name = name_ref.text().unwrap_or_default();
                 match env.get(&name) {
@@ -313,31 +375,53 @@ impl<'db> Lowerer<'db> {
                     None => b.load_int(0),
                 }
             }
-            Expr::Bin(bin) => {
-                let (lhs, rhs) = bin.operands();
-                let l = self.lower_opt(b, env, lhs);
-                let r = self.lower_opt(b, env, rhs);
-                match bin.op() {
-                    Some(BinOp::Add) | None => b.add(l, r),
-                    Some(BinOp::Sub) => b.sub(l, r),
-                    Some(BinOp::Mul) => b.mul(l, r),
-                    Some(BinOp::Div) => b.div(l, r),
-                    Some(BinOp::Lt) => b.cmp(CmpKind::Lt, l, r),
-                    Some(BinOp::Gt) => b.cmp(CmpKind::Gt, l, r),
-                    Some(BinOp::LtEq) => b.cmp(CmpKind::Le, l, r),
-                    Some(BinOp::GtEq) => b.cmp(CmpKind::Ge, l, r),
-                    Some(BinOp::EqEq) => b.cmp(CmpKind::Eq, l, r),
-                    Some(BinOp::NotEq) => b.cmp(CmpKind::Ne, l, r),
-                }
-            }
+            Expr::Bin(bin) => self.lower_bin(b, env, bin),
             Expr::Prefix(prefix) => {
-                // Unary minus lowers as `0 - operand`.
-                let zero = b.load_int(0);
+                // Unary minus lowers as `0 - operand`, in the operand's type.
                 let operand = self.lower_opt(b, env, prefix.operand());
-                b.sub(zero, operand)
+                match b.reg_type(operand) {
+                    Type::Float => {
+                        let zero = b.load_float(0.0);
+                        b.float_arith(IrOp::FSub, zero, operand)
+                    }
+                    Type::Int => {
+                        let zero = b.load_int(0);
+                        b.int_arith(IrOp::Sub, zero, operand)
+                    }
+                }
             }
             Expr::Call(call) => self.lower_call(b, env, call),
             Expr::Paren(paren) => self.lower_opt(b, env, paren.inner()),
+        }
+    }
+
+    fn lower_bin(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, bin: &BinExpr) -> u32 {
+        let (lhs, rhs) = bin.operands();
+        let l = self.lower_opt(b, env, lhs);
+        let r = self.lower_opt(b, env, rhs);
+        // The operation is performed in `float` iff either operand is a float;
+        // both operands are coerced to that common type. Well-typed programs
+        // never actually coerce (their operands already match).
+        let common = if b.reg_type(l) == Type::Float || b.reg_type(r) == Type::Float {
+            Type::Float
+        } else {
+            Type::Int
+        };
+        let l = self.coerce(b, l, common);
+        let r = self.coerce(b, r, common);
+
+        let op = bin.op().unwrap_or(BinOp::Add);
+        match (op, common) {
+            (BinOp::Add, Type::Int) => b.int_arith(IrOp::Add, l, r),
+            (BinOp::Sub, Type::Int) => b.int_arith(IrOp::Sub, l, r),
+            (BinOp::Mul, Type::Int) => b.int_arith(IrOp::Mul, l, r),
+            (BinOp::Div, Type::Int) => b.int_arith(IrOp::Div, l, r),
+            (BinOp::Add, Type::Float) => b.float_arith(IrOp::FAdd, l, r),
+            (BinOp::Sub, Type::Float) => b.float_arith(IrOp::FSub, l, r),
+            (BinOp::Mul, Type::Float) => b.float_arith(IrOp::FMul, l, r),
+            (BinOp::Div, Type::Float) => b.float_arith(IrOp::FDiv, l, r),
+            (cmp, Type::Int) => b.cmp(cmp_kind(cmp), l, r),
+            (cmp, Type::Float) => b.fcmp(cmp_kind(cmp), l, r),
         }
     }
 
@@ -348,21 +432,41 @@ impl<'db> Lowerer<'db> {
         // THE FIREWALL EDGE: reading the callee's *signature* (not its body)
         // creates a salsa dependency that backdates whenever the callee's ABI is
         // unchanged, so a caller is insulated from edits to a callee's internals.
+        // The signature also gives the argument and result *types* used below;
+        // an arity/type mismatch is tolerated here (the lowerer stays total) and
+        // reported by `crate::diag::function_diagnostics`, which the live reload
+        // gates on.
         let callee_key = FnKey::new(self.db, callee_name);
         let callee_sig = function_signature(self.db, self.src, callee_key);
-        // Reading the callee's signature — never its body — is what records
-        // the firewall dependency edge. An arity mismatch here is tolerated by
-        // the lowerer itself (it stays total over arbitrary input); it is
-        // `crate::diag::function_diagnostics` that catches and reports it, and
-        // that is the query a live reload actually gates on.
-        let _callee_arity = callee_sig.arity();
 
         let args: Vec<u32> = call
             .args()
             .iter()
-            .map(|arg| self.lower_expr(b, env, arg))
+            .enumerate()
+            .map(|(i, arg)| {
+                let reg = self.lower_expr(b, env, arg);
+                // Coerce each argument to the callee's declared parameter type.
+                match callee_sig.params.get(i) {
+                    Some(&pty) => self.coerce(b, reg, pty),
+                    None => reg,
+                }
+            })
             .collect();
 
-        b.call(callee_id, args)
+        b.call(callee_id, args, callee_sig.ret)
+    }
+}
+
+/// Map a surface comparison operator to a DevIR [`CmpKind`].
+fn cmp_kind(op: BinOp) -> CmpKind {
+    match op {
+        BinOp::Lt => CmpKind::Lt,
+        BinOp::Gt => CmpKind::Gt,
+        BinOp::LtEq => CmpKind::Le,
+        BinOp::GtEq => CmpKind::Ge,
+        BinOp::EqEq => CmpKind::Eq,
+        BinOp::NotEq => CmpKind::Ne,
+        // Arithmetic ops are dispatched before this is reached.
+        _ => CmpKind::Eq,
     }
 }

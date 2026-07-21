@@ -18,9 +18,10 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::control::ControlPlane;
-use cranelift_codegen::ir::condcodes::IntCC;
+use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
+use cranelift_codegen::ir::immediates::Ieee64;
 use cranelift_codegen::ir::{
-    types, AbiParam, Block, ExtFuncData, ExternalName, InstBuilder, MemFlagsData,
+    types, AbiParam, Block, Endianness, ExtFuncData, ExternalName, InstBuilder, MemFlagsData,
     Signature as ClifSig, UserExternalName, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa, TargetIsa};
@@ -28,7 +29,17 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
-use blaze_ir::{CmpKind, FunctionId, FunctionNode, IrOp};
+use blaze_ir::{CmpKind, FunctionId, FunctionNode, IrOp, Type as BlazeType};
+
+/// The Cranelift machine type carrying a Blaze value: `i64` for `int`, `f64`
+/// for `float`.
+#[inline]
+fn clif_ty(t: BlazeType) -> types::Type {
+    match t {
+        BlazeType::Int => types::I64,
+        BlazeType::Float => types::F64,
+    }
+}
 
 use crate::abi::{OFF_DEPTH, OFF_FUEL, OFF_TRAP, TRAP_FUEL, TRAP_STACK};
 
@@ -118,9 +129,27 @@ pub fn build_body(
     let arity = node.signature.arity();
     let nregs = node.register_count().max(arity);
     let flags = MemFlagsData::trusted();
+    // `bitcast` re-interprets an i64 as an f64 (or back) at each ABI boundary.
+    // Cranelift's verifier requires its flags to name a concrete byte order;
+    // for a same-width scalar the order never reorders bytes, so the host's own
+    // endianness (the JIT target is always the host) is the natural choice.
+    let cast_flags = MemFlagsData::new().with_endianness(if cfg!(target_endian = "big") {
+        Endianness::Big
+    } else {
+        Endianness::Little
+    });
 
-    // One frontend Variable per DevIR register; the SSA builder handles phis.
-    let vars: Vec<_> = (0..nregs).map(|_| builder.declare_var(types::I64)).collect();
+    // The declared type of register `r`. Registers past the recorded end (only
+    // the defensive `.max(arity)` overhang) default to `int`.
+    let reg_ty = |r: u32| node.reg_types.get(r as usize).copied().unwrap_or(BlazeType::Int);
+
+    // One frontend Variable per DevIR register, each carrying its declared
+    // machine type (`i64` or `f64`); the SSA builder handles phis. Values live
+    // in their natural machine type inside the body and are bit-cast to `i64`
+    // only at the call/return ABI boundary below.
+    let vars: Vec<_> = (0..nregs as u32)
+        .map(|r| builder.declare_var(clif_ty(reg_ty(r))))
+        .collect();
     // The per-call context pointer, held in its own variable so it is available
     // (via `use_var`) in every block for the entry guard, calls, and returns.
     let ctx_var = builder.declare_var(types::I64);
@@ -148,11 +177,20 @@ pub fn build_body(
     let ctx_val = all_params[0];
     builder.def_var(ctx_var, ctx_val);
     for (reg, value) in all_params[1..].iter().enumerate() {
-        builder.def_var(vars[reg], *value);
+        // Every ABI parameter arrives as a raw `i64`; a `float` parameter's
+        // register is `f64`, so re-interpret the incoming bits as `f64`.
+        let seed = match reg_ty(reg as u32) {
+            BlazeType::Int => *value,
+            BlazeType::Float => builder.ins().bitcast(types::F64, cast_flags, *value),
+        };
+        builder.def_var(vars[reg], seed);
     }
     if nregs > arity {
-        let zero = builder.ins().iconst(types::I64, 0);
-        for var in &vars[arity..] {
+        for (reg, var) in vars.iter().enumerate().skip(arity) {
+            let zero = match reg_ty(reg as u32) {
+                BlazeType::Int => builder.ins().iconst(types::I64, 0),
+                BlazeType::Float => builder.ins().f64const(Ieee64::with_bits(0)),
+            };
             builder.def_var(*var, zero);
         }
     }
@@ -194,6 +232,12 @@ pub fn build_body(
                 let v = builder.ins().iconst(types::I64, *imm);
                 builder.def_var(vars[*dst as usize], v);
             }
+            IrOp::LoadFloat(dst, imm) => {
+                // Materialize the exact IEEE-754 bit pattern, never a decimal
+                // re-parse, so a lowered constant round-trips bit-for-bit.
+                let v = builder.ins().f64const(Ieee64::with_bits(imm.to_bits()));
+                builder.def_var(vars[*dst as usize], v);
+            }
             IrOp::Add(dst, lhs, rhs) => {
                 let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
                 let v = builder.ins().iadd(a, b);
@@ -214,6 +258,28 @@ pub fn build_body(
                 let v = emit_guarded_sdiv(builder, a, b);
                 builder.def_var(vars[*dst as usize], v);
             }
+            IrOp::FAdd(dst, lhs, rhs) => {
+                let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
+                let v = builder.ins().fadd(a, b);
+                builder.def_var(vars[*dst as usize], v);
+            }
+            IrOp::FSub(dst, lhs, rhs) => {
+                let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
+                let v = builder.ins().fsub(a, b);
+                builder.def_var(vars[*dst as usize], v);
+            }
+            IrOp::FMul(dst, lhs, rhs) => {
+                let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
+                let v = builder.ins().fmul(a, b);
+                builder.def_var(vars[*dst as usize], v);
+            }
+            IrOp::FDiv(dst, lhs, rhs) => {
+                // IEEE division never faults: `x / 0.0` is ±inf or NaN, so no
+                // guard is needed to keep a live-edited script from trapping.
+                let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
+                let v = builder.ins().fdiv(a, b);
+                builder.def_var(vars[*dst as usize], v);
+            }
             IrOp::Cmp(kind, dst, lhs, rhs) => {
                 let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
                 let cc = match kind {
@@ -228,6 +294,23 @@ pub fn build_body(
                 let v = builder.ins().uextend(types::I64, flag);
                 builder.def_var(vars[*dst as usize], v);
             }
+            IrOp::FCmp(kind, dst, lhs, rhs) => {
+                let (a, b) = (builder.use_var(vars[*lhs as usize]), builder.use_var(vars[*rhs as usize]));
+                // Ordered for `<`, `<=`, `>`, `>=`, `==` (NaN compares false);
+                // unordered for `!=` (NaN compares true) — matching C's `==`/`!=`
+                // semantics, where the result register is an `int` boolean.
+                let cc = match kind {
+                    CmpKind::Lt => FloatCC::LessThan,
+                    CmpKind::Le => FloatCC::LessThanOrEqual,
+                    CmpKind::Gt => FloatCC::GreaterThan,
+                    CmpKind::Ge => FloatCC::GreaterThanOrEqual,
+                    CmpKind::Eq => FloatCC::Equal,
+                    CmpKind::Ne => FloatCC::NotEqual,
+                };
+                let flag = builder.ins().fcmp(cc, a, b);
+                let v = builder.ins().uextend(types::I64, flag);
+                builder.def_var(vars[*dst as usize], v);
+            }
             IrOp::Copy(dst, src) => {
                 let v = builder.use_var(vars[*src as usize]);
                 builder.def_var(vars[*dst as usize], v);
@@ -238,13 +321,34 @@ pub fn build_body(
                 let oof = ensure_block(builder, &mut out_of_fuel);
                 emit_fuel_check(builder, ctx_var, flags, oof);
                 let ctx = builder.use_var(ctx_var);
-                let arg_values: Vec<Value> =
-                    args.iter().map(|r| builder.use_var(vars[*r as usize])).collect();
+                // The ABI carries every argument as a raw `i64`; re-interpret
+                // each `float` argument's bits before the call.
+                let mut arg_values: Vec<Value> = Vec::with_capacity(args.len());
+                for r in args {
+                    let v = builder.use_var(vars[*r as usize]);
+                    let v = match reg_ty(*r) {
+                        BlazeType::Int => v,
+                        BlazeType::Float => builder.ins().bitcast(types::I64, cast_flags, v),
+                    };
+                    arg_values.push(v);
+                }
                 let result = emitter.emit_call(builder, ctx, *callee, &arg_values);
+                // The result comes back as a raw `i64`; if this call's register
+                // is `float`, re-interpret those bits as `f64`.
+                let result = match reg_ty(*dst) {
+                    BlazeType::Int => result,
+                    BlazeType::Float => builder.ins().bitcast(types::F64, cast_flags, result),
+                };
                 builder.def_var(vars[*dst as usize], result);
             }
             IrOp::Return(value) => {
                 let v = builder.use_var(vars[*value as usize]);
+                // The ABI returns a raw `i64`; a `float` return re-interprets
+                // its bits so the caller (which bit-casts back) sees the value.
+                let v = match reg_ty(*value) {
+                    BlazeType::Int => v,
+                    BlazeType::Float => builder.ins().bitcast(types::I64, cast_flags, v),
+                };
                 emit_return(builder, ctx_var, flags, v);
                 terminated = true;
             }

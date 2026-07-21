@@ -199,8 +199,8 @@ impl<'a> Parser<'a> {
         self.builder.start_node(SyntaxKind::SOURCE_FILE.into());
         while let Some(kind) = self.current() {
             match kind {
-                SyntaxKind::INT_KW => self.function(),
-                _ => self.error_bump("expected `int` to begin a function".into()),
+                SyntaxKind::INT_KW | SyntaxKind::FLOAT_KW => self.function(),
+                _ => self.error_bump("expected a type (`int` or `float`) to begin a function".into()),
             }
         }
         // Trailing trivia (e.g. a final newline) belongs to the file node.
@@ -212,7 +212,7 @@ impl<'a> Parser<'a> {
 
     fn function(&mut self) {
         self.start(SyntaxKind::FN);
-        self.expect(SyntaxKind::INT_KW); // return type
+        self.type_ref(); // return type
         self.name();
         self.param_list();
         self.block();
@@ -224,6 +224,23 @@ impl<'a> Parser<'a> {
         self.start(SyntaxKind::NAME);
         self.expect(SyntaxKind::IDENT);
         self.finish();
+    }
+
+    /// A type in a declaration position: `int` or `float`, wrapped in a TYPE
+    /// node so the typed AST can read it uniformly.
+    fn type_ref(&mut self) {
+        self.start(SyntaxKind::TYPE);
+        match self.current() {
+            Some(SyntaxKind::INT_KW) | Some(SyntaxKind::FLOAT_KW) => self.bump(),
+            _ => self.error("expected a type (`int` or `float`)".into()),
+        }
+        self.finish();
+    }
+
+    /// Whether the cursor is at the start of a type (and therefore a
+    /// declaration).
+    fn at_type(&mut self) -> bool {
+        matches!(self.current(), Some(SyntaxKind::INT_KW) | Some(SyntaxKind::FLOAT_KW))
     }
 
     fn param_list(&mut self) {
@@ -242,7 +259,7 @@ impl<'a> Parser<'a> {
 
     fn param(&mut self) {
         self.start(SyntaxKind::PARAM);
-        self.expect(SyntaxKind::INT_KW);
+        self.type_ref();
         self.name();
         self.finish();
     }
@@ -261,8 +278,10 @@ impl<'a> Parser<'a> {
     }
 
     fn statement(&mut self) {
+        if self.at_type() {
+            return self.let_stmt();
+        }
         match self.current() {
-            Some(SyntaxKind::INT_KW) => self.let_stmt(),
             Some(SyntaxKind::RETURN_KW) => self.return_stmt(),
             Some(SyntaxKind::IF_KW) => self.if_stmt(),
             Some(SyntaxKind::WHILE_KW) => self.while_stmt(),
@@ -276,7 +295,7 @@ impl<'a> Parser<'a> {
 
     fn let_stmt(&mut self) {
         self.start(SyntaxKind::LET_STMT);
-        self.expect(SyntaxKind::INT_KW);
+        self.type_ref();
         self.name();
         self.expect(SyntaxKind::EQ);
         self.expr();
@@ -380,7 +399,7 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self) {
         match self.current() {
-            Some(SyntaxKind::INT_LITERAL) => {
+            Some(SyntaxKind::INT_LITERAL) | Some(SyntaxKind::FLOAT_LITERAL) => {
                 self.start(SyntaxKind::LITERAL_EXPR);
                 self.bump();
                 self.finish();
@@ -473,6 +492,14 @@ int count(int n) {
         let parse = parse(src);
         assert!(parse.errors().is_empty(), "unexpected errors: {:?}", parse.errors());
         assert_eq!(parse.syntax().text().to_string(), src, "must stay lossless");
+    }
+
+    #[test]
+    fn parses_float_declarations_losslessly() {
+        let src = "float mix(float a, float b) {\n  float t = 0.25;\n  return a * t + b;\n}\n";
+        let parse = parse(src);
+        assert!(parse.errors().is_empty(), "unexpected errors: {:?}", parse.errors());
+        assert_eq!(parse.syntax().text().to_string(), src);
     }
 
     #[test]
