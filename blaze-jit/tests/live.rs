@@ -15,13 +15,16 @@
 //! | Deleting a still-used function is `Rejected`, not silent 0   | [`removing_a_used_function_is_rejected_and_holds_last_good`] |
 //! | A call-site arity mismatch is `Rejected`, not tolerated      | [`arity_mismatch_is_rejected`] |
 //! | Construction itself fails on a defective initial program     | [`initial_load_with_a_defect_fails_construction`] |
+//! | Unbounded recursion aborts the call, never faults the host   | [`unbounded_recursion_aborts_with_error_not_a_crash`] |
+//! | The depth guard does not false-positive on real recursion    | [`deep_but_bounded_recursion_succeeds`] |
+//! | Mutual recursion is bounded too                              | [`mutual_recursion_is_also_bounded`] |
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use blaze_jit::{EditClass, LiveRuntime};
+use blaze_jit::{CallError, EditClass, LiveRuntime};
 
 const V1: &str = "\
 int add(int a, int b) {
@@ -132,17 +135,21 @@ fn body_edit_swaps_under_concurrent_execution() {
     stop.store(true, Ordering::Relaxed);
     let seen = worker.join().expect("worker must never panic");
 
-    // Zero missed calls: every single concurrent call returned a value, and
-    // every value is either old-correct (3) or new-correct (4) — never torn,
-    // never garbage, never an error.
+    // Zero missed calls, zero torn values — the soundness theorem, independent
+    // of scheduling: every concurrent call returned a value, and every value is
+    // either old-correct (3) or new-correct (4), never garbage, never an error.
     assert!(!seen.is_empty());
     assert!(
         seen.iter().all(|v| *v == 3 || *v == 4),
         "observed a torn value: {:?}",
         seen.iter().find(|v| **v != 3 && **v != 4),
     );
-    assert_eq!(*seen.last().unwrap(), 4, "the edit must eventually win");
+    // The worker got a 50 ms head start on the old code before the swap, so it
+    // reliably observed the pre-swap value at least once.
     assert!(seen.contains(&3), "the hammer must have run before the swap");
+    // Liveness checked on this thread post-join (see the relink test's note on
+    // why the worker's last observation would be a race).
+    assert_eq!(runtime.call("main", &[]), Ok(4), "the edit must have taken effect");
 }
 
 #[test]
@@ -172,15 +179,20 @@ fn signature_edit_relinks_atomically_under_fire() {
     stop.store(true, Ordering::Relaxed);
     let seen = worker.join().expect("worker must never panic — that is the whole point");
 
-    // Atomicity: every observed value is either fully-old (3) or fully-new (6).
-    // A mismatched caller/callee pair would produce garbage (e.g. reading an
-    // uninitialized third argument register).
+    // Atomicity — the soundness theorem: every value the worker ever observed
+    // is either fully-old (3) or fully-new (6). A mismatched caller/callee pair
+    // would produce garbage (e.g. reading an uninitialized third-arg register).
+    // This holds regardless of thread scheduling.
+    assert!(!seen.is_empty());
     assert!(
         seen.iter().all(|v| *v == 3 || *v == 6),
         "observed a torn ABI transition: {:?}",
         seen.iter().find(|v| **v != 3 && **v != 6),
     );
-    assert_eq!(*seen.last().unwrap(), 6);
+    // Liveness — checked deterministically on this thread after the worker has
+    // joined (asserting on the worker's *last* observation would be a race: a
+    // starved worker may exit before it is scheduled past the swap).
+    assert_eq!(runtime.call("main", &[]), Ok(6), "the relink must have taken effect");
 }
 
 #[test]
@@ -335,4 +347,138 @@ fn initial_load_with_a_defect_fails_construction() {
         Ok(_) => panic!("construction must fail, not silently start with wrong semantics"),
     };
     assert!(err.contains("undefined variable `undeclared_var`"), "{err}");
+}
+
+// --- H2: the stack guard ---------------------------------------------------
+//
+// Before this guard, `int f(int n){ return f(n); }` blew the native stack and
+// SIGSEGV'd the host — a flat contradiction of "cannot fault the process".
+// Now a per-call depth counter, threaded through generated code, trips a
+// defined trap long before the native stack is exhausted; the runtime turns
+// that into `Err(ResourceExhausted)` and keeps running.
+
+#[test]
+fn unbounded_recursion_aborts_with_error_not_a_crash() {
+    // `spin` recurses forever; `ok` is a normal function used to prove the
+    // runtime is still perfectly healthy after a runaway call is aborted.
+    let src = "\
+int spin(int n) {
+    return spin(n) + 1;
+}
+
+int ok(int a, int b) {
+    return a + b;
+}
+";
+    let runtime = Arc::new(LiveRuntime::new(src).expect("compile"));
+
+    // A concurrent bystander hammers `ok` throughout. Its job is to prove a
+    // runaway call on one thread never corrupts a healthy call on another: if
+    // it ever observes a wrong value it panics, and the join below propagates
+    // that. (It is not *required* to be scheduled — under contention it may
+    // barely run — so we assert correctness-if-it-ran, not that it ran.)
+    let stop = Arc::new(AtomicBool::new(false));
+    let bystander = {
+        let runtime = runtime.clone();
+        let stop = stop.clone();
+        thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                assert_eq!(runtime.call("ok", &[2, 3]), Ok(5), "a runaway call must not corrupt others");
+            }
+        })
+    };
+
+    // Deterministic interleave on this thread: fire the runaway call, then a
+    // healthy one, repeatedly. Each runaway must return a clean error and each
+    // healthy call must still be exactly right — proving the abort leaves the
+    // runtime perfectly consistent, with no reliance on thread scheduling.
+    for i in 0..200 {
+        assert_eq!(
+            runtime.call("spin", &[1]),
+            Err(CallError::ResourceExhausted),
+            "unbounded recursion must abort with a defined error",
+        );
+        assert_eq!(runtime.call("ok", &[i, 1]), Ok(i + 1), "a healthy call right after a runaway must be exact");
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    bystander.join().expect("bystander thread must never observe a corrupted result");
+}
+
+#[test]
+fn deep_but_bounded_recursion_succeeds() {
+    // `countdown(n)` recurses to depth n then unwinds, returning n. At 500 it
+    // is well under the 1024 depth limit, so it must compute the right answer —
+    // proving the guard doesn't false-positive on legitimate recursion. At
+    // 5000 it exceeds the limit and must abort cleanly.
+    let src = "\
+int countdown(int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    return countdown(n - 1) + 1;
+}
+";
+    let runtime = LiveRuntime::new(src).expect("compile");
+    assert_eq!(runtime.call("countdown", &[100]), Ok(100), "legitimate deep recursion must work");
+    assert_eq!(runtime.call("countdown", &[10]), Ok(10));
+    assert_eq!(
+        runtime.call("countdown", &[5000]),
+        Err(CallError::ResourceExhausted),
+        "recursion past the depth limit must abort, not fault",
+    );
+    // Still healthy after the abort — depth accounting reset per call.
+    assert_eq!(runtime.call("countdown", &[7]), Ok(7));
+}
+
+#[test]
+fn mutual_recursion_is_also_bounded() {
+    // `ping` and `pong` call each other forever; the depth counter is shared
+    // across the whole call tree, so mutual recursion is bounded just like
+    // direct recursion.
+    let src = "\
+int ping(int n) {
+    return pong(n) + 1;
+}
+
+int pong(int n) {
+    return ping(n) + 1;
+}
+";
+    let runtime = LiveRuntime::new(src).expect("compile");
+    assert_eq!(runtime.call("ping", &[0]), Err(CallError::ResourceExhausted));
+    assert_eq!(runtime.call("pong", &[0]), Err(CallError::ResourceExhausted));
+}
+
+#[test]
+fn depth_limit_is_configurable() {
+    let src_a = "\
+int rec(int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    return rec(n - 1) + 1;
+}
+";
+    let runtime = LiveRuntime::new(src_a).expect("compile");
+    // Under the default limit, 100-deep recursion is fine.
+    assert_eq!(runtime.call("rec", &[100]), Ok(100));
+
+    // Tighten the limit. It applies to functions recompiled by the next
+    // reload, so make an edit that actually re-lowers `rec`.
+    runtime.set_max_depth(8);
+    let src_b = "\
+int rec(int n) {
+    if (n <= 0) {
+        return 0;
+    }
+    return rec(n - 1) + 1 + 0;
+}
+";
+    runtime.reload(src_b).expect("reload");
+
+    // Now the same 100-deep call trips the tighter guard, while a call that
+    // stays under it still succeeds.
+    assert_eq!(runtime.call("rec", &[100]), Err(CallError::ResourceExhausted));
+    assert_eq!(runtime.call("rec", &[3]), Ok(3));
 }

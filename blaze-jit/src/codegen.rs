@@ -20,15 +20,17 @@ use std::collections::HashMap;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    types, AbiParam, ExtFuncData, ExternalName, InstBuilder, Signature as ClifSig,
+    types, AbiParam, ExtFuncData, ExternalName, InstBuilder, MemFlagsData, Signature as ClifSig,
     UserExternalName, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_codegen::Context;
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use blaze_ir::{CmpKind, FunctionId, FunctionNode, IrOp};
+
+use crate::abi::{OFF_DEPTH, OFF_TRAP, TRAP_STACK};
 
 /// Build a Cranelift target ISA for the host machine.
 ///
@@ -47,10 +49,27 @@ pub fn host_isa() -> Result<OwnedTargetIsa, String> {
         .map_err(|e| e.to_string())
 }
 
-/// The Cranelift signature for a Blaze function of the given arity: every
-/// parameter and the single result are machine `i64`.
+/// The default maximum Blaze call-nesting depth before a prologue traps instead
+/// of recursing.
+///
+/// The whole point of the guard is to abort runaway recursion *well before* the
+/// native stack is exhausted, so this is deliberately conservative: even with
+/// generously-sized frames it uses only a fraction of a small (e.g. 2 MiB)
+/// thread stack, leaving a wide safety margin on any host. Legitimate recursion
+/// in a live-logic script is shallow; a host that genuinely needs more can
+/// raise the limit (see `LiveRuntime::set_max_depth`). Baked into each
+/// function's entry guard at compile time.
+pub const DEFAULT_MAX_DEPTH: u64 = 256;
+
+/// The Cranelift signature for a Blaze function of the given arity.
+///
+/// Every function takes a hidden leading pointer argument — the per-call
+/// [`crate::abi::CallState`] (the "context") — followed by `arity` `i64`
+/// parameters, returning a single `i64`. Generated prologues and call sites
+/// thread this context through so depth/fuel accounting needs no thread-locals.
 pub fn clif_signature(arity: usize, call_conv: CallConv) -> ClifSig {
     let mut sig = ClifSig::new(call_conv);
+    sig.params.push(AbiParam::new(types::I64)); // hidden context pointer
     for _ in 0..arity {
         sig.params.push(AbiParam::new(types::I64));
     }
@@ -62,10 +81,15 @@ pub fn clif_signature(arity: usize, call_conv: CallConv) -> ClifSig {
 ///  * direct-module: `call` against a `FuncId` declared in a live `JITModule`;
 ///  * isolated: `call` against an imported user external (a relocation);
 ///  * live table: `call_indirect` through the hot-swap slot table.
+///
+/// Every implementation must pass `ctx` as the callee's hidden leading
+/// argument (see [`clif_signature`]), so the per-call state flows down the
+/// whole call tree.
 pub trait CallEmitter {
     fn emit_call(
         &mut self,
         builder: &mut FunctionBuilder,
+        ctx: Value,
         callee: FunctionId,
         args: &[Value],
     ) -> Value;
@@ -73,12 +97,26 @@ pub trait CallEmitter {
 
 /// Emit the body of `node` into `builder`. The builder must be freshly created
 /// for `node`'s function; this seals all blocks but the caller finalizes.
-pub fn build_body(builder: &mut FunctionBuilder, node: &FunctionNode, emitter: &mut dyn CallEmitter) {
+///
+/// `max_depth` is the call-nesting limit baked into the entry guard (H2): a
+/// prologue that would exceed it records [`TRAP_STACK`] in the context and
+/// returns `0` instead of recursing, so unbounded recursion can never fault
+/// the host. The runtime turns that trap into `Err(ResourceExhausted)`.
+pub fn build_body(
+    builder: &mut FunctionBuilder,
+    node: &FunctionNode,
+    max_depth: u64,
+    emitter: &mut dyn CallEmitter,
+) {
     let arity = node.signature.arity();
     let nregs = node.register_count().max(arity);
+    let flags = MemFlagsData::trusted();
 
     // One frontend Variable per DevIR register; the SSA builder handles phis.
     let vars: Vec<_> = (0..nregs).map(|_| builder.declare_var(types::I64)).collect();
+    // The per-call context pointer, held in its own variable so it is available
+    // (via `use_var`) in every block for the entry guard, calls, and returns.
+    let ctx_var = builder.declare_var(types::I64);
 
     // One Cranelift block per bound DevIR label (lowering guarantees every
     // referenced label is bound exactly once).
@@ -90,15 +128,20 @@ pub fn build_body(builder: &mut FunctionBuilder, node: &FunctionNode, emitter: &
     }
 
     let entry = builder.create_block();
+    let guard_trap = builder.create_block();
+    let body_start = builder.create_block();
     builder.append_block_params_for_function_params(entry);
     builder.switch_to_block(entry);
 
-    // Seed parameters, then zero-initialize every other register so a `use_var`
-    // is total on all paths even for variables first assigned inside a branch
-    // (the C-subset has flat function scope).
-    let params = builder.block_params(entry).to_vec();
-    for (reg, value) in params.into_iter().enumerate() {
-        builder.def_var(vars[reg], value);
+    // Block param 0 is the hidden context pointer; the real Blaze parameters
+    // follow it. Seed each into its variable, then zero-initialize every other
+    // register so a `use_var` is total on all paths even for variables first
+    // assigned inside a branch (the C-subset has flat function scope).
+    let all_params = builder.block_params(entry).to_vec();
+    let ctx_val = all_params[0];
+    builder.def_var(ctx_var, ctx_val);
+    for (reg, value) in all_params[1..].iter().enumerate() {
+        builder.def_var(vars[reg], *value);
     }
     if nregs > arity {
         let zero = builder.ins().iconst(types::I64, 0);
@@ -107,6 +150,27 @@ pub fn build_body(builder: &mut FunctionBuilder, node: &FunctionNode, emitter: &
         }
     }
 
+    // ---- Entry guard (H2): bump depth; trap if it would exceed the limit ----
+    let depth = builder.ins().load(types::I64, flags, ctx_val, OFF_DEPTH);
+    let one = builder.ins().iconst(types::I64, 1);
+    let depth_next = builder.ins().iadd(depth, one);
+    builder.ins().store(flags, depth_next, ctx_val, OFF_DEPTH);
+    let limit = builder.ins().iconst(types::I64, max_depth as i64);
+    let over = builder.ins().icmp(IntCC::UnsignedGreaterThan, depth_next, limit);
+    builder.ins().brif(over, guard_trap, &[], body_start, &[]);
+
+    // The trap arm: undo the increment (keeping the counter balanced for the
+    // frames still unwinding), record the trap, and return a defined 0.
+    builder.switch_to_block(guard_trap);
+    let d = builder.ins().load(types::I64, flags, ctx_val, OFF_DEPTH);
+    let d_dec = builder.ins().isub(d, one);
+    builder.ins().store(flags, d_dec, ctx_val, OFF_DEPTH);
+    let trap_code = builder.ins().iconst(types::I64, TRAP_STACK);
+    builder.ins().store(flags, trap_code, ctx_val, OFF_TRAP);
+    let zero = builder.ins().iconst(types::I64, 0);
+    builder.ins().return_(&[zero]);
+
+    builder.switch_to_block(body_start);
     let mut terminated = false;
     for op in &node.body {
         // Skip straight-line ops that lowering placed nowhere reachable; only a
@@ -159,14 +223,15 @@ pub fn build_body(builder: &mut FunctionBuilder, node: &FunctionNode, emitter: &
                 builder.def_var(vars[*dst as usize], v);
             }
             IrOp::Call(dst, callee, args) => {
+                let ctx = builder.use_var(ctx_var);
                 let arg_values: Vec<Value> =
                     args.iter().map(|r| builder.use_var(vars[*r as usize])).collect();
-                let result = emitter.emit_call(builder, *callee, &arg_values);
+                let result = emitter.emit_call(builder, ctx, *callee, &arg_values);
                 builder.def_var(vars[*dst as usize], result);
             }
             IrOp::Return(value) => {
                 let v = builder.use_var(vars[*value as usize]);
-                builder.ins().return_(&[v]);
+                emit_return(builder, ctx_var, flags, v);
                 terminated = true;
             }
             IrOp::Jump(label) => {
@@ -199,10 +264,22 @@ pub fn build_body(builder: &mut FunctionBuilder, node: &FunctionNode, emitter: &
     // off the end returns 0 (defensive: lowering already guarantees a Return).
     if !terminated {
         let zero = builder.ins().iconst(types::I64, 0);
-        builder.ins().return_(&[zero]);
+        emit_return(builder, ctx_var, flags, zero);
     }
 
     builder.seal_all_blocks();
+}
+
+/// Emit a normal function return, first dropping the call-depth counter so the
+/// nesting count reflects only live frames (a loop that calls a function many
+/// times must not accumulate depth).
+fn emit_return(builder: &mut FunctionBuilder, ctx_var: Variable, flags: MemFlagsData, value: Value) {
+    let ctx = builder.use_var(ctx_var);
+    let depth = builder.ins().load(types::I64, flags, ctx, OFF_DEPTH);
+    let one = builder.ins().iconst(types::I64, 1);
+    let depth_dec = builder.ins().isub(depth, one);
+    builder.ins().store(flags, depth_dec, ctx, OFF_DEPTH);
+    builder.ins().return_(&[value]);
 }
 
 /// Signed division that cannot trap: `x / 0 == 0`, `INT_MIN / -1 == INT_MIN`.
@@ -240,6 +317,7 @@ impl CallEmitter for IsolatedEmitter {
     fn emit_call(
         &mut self,
         builder: &mut FunctionBuilder,
+        ctx: Value,
         _callee: FunctionId,
         args: &[Value],
     ) -> Value {
@@ -256,7 +334,11 @@ impl CallEmitter for IsolatedEmitter {
             colocated: false,
             patchable: false,
         });
-        let call = builder.ins().call(callee_ref, args);
+        // Thread the context pointer as the callee's hidden leading argument.
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(ctx);
+        call_args.extend_from_slice(args);
+        let call = builder.ins().call(callee_ref, &call_args);
         builder.inst_results(call)[0]
     }
 }
@@ -274,7 +356,7 @@ pub fn compile_isolated(isa: &dyn TargetIsa, node: &FunctionNode) -> Result<Vec<
     {
         let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
         let mut emitter = IsolatedEmitter { call_conv, next_index: 0 };
-        build_body(&mut builder, node, &mut emitter);
+        build_body(&mut builder, node, DEFAULT_MAX_DEPTH, &mut emitter);
         builder.finalize(isa.frontend_config());
     }
 

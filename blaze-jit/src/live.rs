@@ -30,8 +30,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use cranelift_codegen::ir::{InstBuilder, MemFlagsData, UserFuncName, Value};
+use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature as ClifSig, UserFuncName, Value};
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
+use cranelift_codegen::ir::types;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
@@ -42,18 +43,20 @@ use blaze_ir::lower::{lowered_dev_ir, program_outline};
 use blaze_ir::{Diagnostic, FunctionId, FunctionNode};
 use salsa::Setter;
 
-use crate::codegen::{build_body, clif_signature, host_isa, CallEmitter};
+use crate::abi::{self, CallState, MAX_ARITY, TRAP_FUEL, TRAP_STACK};
+use crate::codegen::{build_body, clif_signature, host_isa, CallEmitter, DEFAULT_MAX_DEPTH};
 
 /// Maximum number of distinct functions (source + host) a runtime can hold.
 const TABLE_CAPACITY: usize = 1024;
 
-/// Maximum call arity `LiveRuntime::call` can dispatch.
-const MAX_ARITY: usize = 8;
-
 /// Target of any slot whose function is missing (never defined, or removed by
-/// an edit). Returning a defined `0` keeps a live process crash-free even when
-/// an edit deletes a function out from under a caller.
-extern "C" fn missing_stub() -> i64 {
+/// an edit). Takes the hidden context pointer like every other slot target and
+/// returns a defined `0`, so even a stray call lands somewhere harmless.
+///
+/// With the H1 diagnostics gate in place this is unreachable through the public
+/// API (an undefined callee is rejected before any generation is committed); it
+/// remains as defense-in-depth for slots allocated but never assigned.
+extern "C" fn missing_stub(_ctx: *mut CallState) -> i64 {
     0
 }
 
@@ -98,7 +101,7 @@ impl SwapTable {
         // Every slot starts as the missing stub, so even a call emitted against
         // a never-defined function lands somewhere harmless.
         for i in 0..TABLE_CAPACITY {
-            table.slot(i).store(missing_stub as extern "C" fn() -> i64 as usize as u64, Ordering::Release);
+            table.slot(i).store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
         }
         Ok(table)
     }
@@ -144,6 +147,7 @@ impl CallEmitter for TableEmitter<'_> {
     fn emit_call(
         &mut self,
         builder: &mut FunctionBuilder,
+        ctx: Value,
         callee: FunctionId,
         args: &[Value],
     ) -> Value {
@@ -153,17 +157,17 @@ impl CallEmitter for TableEmitter<'_> {
             .expect("slot allocated for every callee before compilation");
         let slot_addr = self.table.slot_addr(slot_index) as i64;
 
-        let addr = builder.ins().iconst(cranelift_codegen::ir::types::I64, slot_addr);
+        let addr = builder.ins().iconst(types::I64, slot_addr);
         // Acquire-load pairs with the reloader's release-store, so a caller
         // that observes a new pointer also observes the fully written code
         // behind it.
-        let target = builder.ins().atomic_load(
-            cranelift_codegen::ir::types::I64,
-            MemFlagsData::trusted(),
-            addr,
-        );
+        let target = builder.ins().atomic_load(types::I64, MemFlagsData::trusted(), addr);
         let sig_ref = builder.import_signature(clif_signature(args.len(), self.call_conv));
-        let call = builder.ins().call_indirect(sig_ref, target, args);
+        // Thread the context pointer as the callee's hidden leading argument.
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(ctx);
+        call_args.extend_from_slice(args);
+        let call = builder.ins().call_indirect(sig_ref, target, &call_args);
         builder.inst_results(call)[0]
     }
 }
@@ -221,12 +225,18 @@ pub struct ReloadReport {
     pub diagnostics: Vec<(String, Diagnostic)>,
 }
 
-/// Why a [`LiveRuntime::call`] could not run.
+/// Why a [`LiveRuntime::call`] could not run, or could not run to completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
     UnknownFunction(String),
     ArityMismatch { name: String, expected: usize, got: usize },
     UnsupportedArity(usize),
+    /// The call exceeded the call-nesting limit (runaway recursion). The call
+    /// was aborted and the process/runtime left consistent; nothing faulted.
+    ResourceExhausted,
+    /// The call exhausted its execution budget (e.g. an infinite loop). The
+    /// call was aborted deterministically; the runtime remains usable. (H3)
+    FuelExhausted,
 }
 
 impl std::fmt::Display for CallError {
@@ -237,6 +247,12 @@ impl std::fmt::Display for CallError {
                 write!(f, "`{name}` takes {expected} argument(s), got {got}")
             }
             CallError::UnsupportedArity(n) => write!(f, "arity {n} exceeds the dispatch limit"),
+            CallError::ResourceExhausted => {
+                write!(f, "call aborted: exceeded the call-depth limit (runaway recursion)")
+            }
+            CallError::FuelExhausted => {
+                write!(f, "call aborted: exhausted its execution budget")
+            }
         }
     }
 }
@@ -264,6 +280,12 @@ struct LiveInner {
     /// for Blaze-defined ones.
     host_functions: HostFunctions,
     isa: OwnedTargetIsa,
+    /// Call-nesting limit baked into every generation's entry guards (H2).
+    max_depth: u64,
+    /// Dedicated module holding the `(ctx, args…) -> ret` trampolines that let
+    /// host-registered native functions (which take no context pointer) be
+    /// called through the same context-threading ABI as Blaze functions.
+    trampolines: JITModule,
     /// DevIR snapshot of the previous generation, for blast-radius diffing.
     prev: HashMap<String, std::sync::Arc<FunctionNode>>,
     /// Stable slot assignment. A name keeps its slot for the runtime's life.
@@ -300,6 +322,8 @@ impl LiveRuntime {
         let src = SourceProgram::new(&db, source.to_string());
         let host_functions = HostFunctions::new(&db, std::collections::BTreeMap::new());
         let isa = host_isa()?;
+        let trampolines =
+            JITModule::new(JITBuilder::with_isa(isa.clone(), default_libcall_names()));
 
         let runtime = LiveRuntime {
             table: SwapTable::new()?,
@@ -309,6 +333,8 @@ impl LiveRuntime {
                 src,
                 host_functions,
                 isa,
+                max_depth: DEFAULT_MAX_DEPTH,
+                trampolines,
                 prev: HashMap::new(),
                 slots: HashMap::new(),
                 next_slot: 0,
@@ -352,7 +378,11 @@ impl LiveRuntime {
         arities.insert(name.to_string(), arity);
         inner.host_functions.set_arities(&mut inner.db).to(arities);
 
-        self.table.slot(slot).store(ptr as u64, Ordering::Release);
+        // Compile a trampoline that accepts (and ignores) the hidden context
+        // pointer, then tail-calls the real host function, so host functions
+        // are invoked through the same ABI as Blaze functions.
+        let trampoline = compile_host_trampoline(&mut inner.trampolines, arity, ptr);
+        self.table.slot(slot).store(trampoline as u64, Ordering::Release);
         self.dispatch
             .write()
             .unwrap()
@@ -375,6 +405,11 @@ impl LiveRuntime {
 
     /// Invoke `name` with `args`. Safe to call from any thread, concurrently
     /// with reloads.
+    ///
+    /// Runaway recursion and (once fuel is enabled) runaway loops abort the
+    /// *call* with [`CallError::ResourceExhausted`] / [`CallError::FuelExhausted`]
+    /// instead of faulting the process; the runtime stays fully usable and
+    /// subsequent calls are unaffected.
     pub fn call(&self, name: &str, args: &[i64]) -> Result<i64, CallError> {
         // Root-call read lock: held while Blaze code runs, so a Relink commit
         // (write lock) can never interleave with an in-flight call.
@@ -396,17 +431,36 @@ impl LiveRuntime {
 
         let code = self.table.slot(entry.slot).load(Ordering::Acquire) as usize as *const u8;
 
+        // Fresh per-call state on this thread's stack — automatically per-thread
+        // and per-call, so concurrent callers never share counters. Fuel is
+        // disabled here (H2); the depth guard is always active.
+        let mut state = CallState::new(u64::MAX);
+
         // SAFETY: `code` is either the missing stub or a finalized function
-        // compiled with the `(i64 × arity) -> i64` signature; the arity was
-        // checked against the dispatch table, which is updated atomically with
-        // the slots it describes.
-        let result = unsafe { dispatch_by_arity(code, args) };
-        Ok(result)
+        // compiled with the context-threading `(*mut CallState, i64 × arity)`
+        // signature; the arity was checked against the dispatch table, which is
+        // updated atomically with the slots it describes.
+        let result = unsafe { abi::invoke(code, &mut state, args) };
+
+        match state.trap as i64 {
+            TRAP_STACK => Err(CallError::ResourceExhausted),
+            TRAP_FUEL => Err(CallError::FuelExhausted),
+            _ => Ok(result),
+        }
     }
 
     /// Number of completed generations (0 after `new`, +1 per effective reload).
     pub fn generation(&self) -> usize {
         self.inner.lock().unwrap().generation
+    }
+
+    /// Set the call-nesting depth limit baked into future generations' entry
+    /// guards (H2). Takes effect on the next reload; existing compiled code
+    /// keeps the limit it was built with. Must be chosen so that
+    /// `limit × worst-case-frame-size` stays comfortably within the stack of
+    /// every thread that will call into the runtime.
+    pub fn set_max_depth(&self, limit: u64) {
+        self.inner.lock().unwrap().max_depth = limit;
     }
 
     /// Enable query-execution tracing on the underlying database (testing:
@@ -542,6 +596,7 @@ impl LiveRuntime {
             default_libcall_names(),
         ));
         let call_conv = inner.isa.default_call_conv();
+        let max_depth = inner.max_depth;
         let mut fb_ctx = FunctionBuilderContext::new();
         for (name, node) in &changed {
             let sig = clif_signature(node.signature.arity(), call_conv);
@@ -559,7 +614,7 @@ impl LiveRuntime {
                     table: &self.table,
                     slots: &inner.slots,
                 };
-                build_body(&mut builder, node, &mut emitter);
+                build_body(&mut builder, node, max_depth, &mut emitter);
                 builder.finalize(inner.isa.frontend_config());
             }
             module
@@ -606,7 +661,7 @@ impl LiveRuntime {
                 if let Some(&slot) = inner.slots.get(&id) {
                     self.table
                         .slot(slot)
-                        .store(missing_stub as extern "C" fn() -> i64 as usize as u64, Ordering::Release);
+                        .store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
                 }
                 dispatch.remove(name);
             }
@@ -642,32 +697,54 @@ impl LiveRuntime {
     }
 }
 
-/// Transmute `code` to the C ABI signature selected by `args.len()` and call.
+/// Compile a `(ctx, args…) -> i64` trampoline that drops the hidden context
+/// pointer and calls the real host function `host_ptr` (which takes only the
+/// `args`), returning the trampoline's finalized address.
 ///
-/// # Safety
-///
-/// `code` must be executable and follow the `(i64 × n) -> i64` C ABI for
-/// `n = args.len() <= MAX_ARITY`.
-unsafe fn dispatch_by_arity(code: *const u8, args: &[i64]) -> i64 {
-    use std::mem::transmute as t;
-    match *args {
-        [] => t::<*const u8, extern "C" fn() -> i64>(code)(),
-        [a] => t::<*const u8, extern "C" fn(i64) -> i64>(code)(a),
-        [a, b] => t::<*const u8, extern "C" fn(i64, i64) -> i64>(code)(a, b),
-        [a, b, c] => t::<*const u8, extern "C" fn(i64, i64, i64) -> i64>(code)(a, b, c),
-        [a, b, c, d] => t::<*const u8, extern "C" fn(i64, i64, i64, i64) -> i64>(code)(a, b, c, d),
-        [a, b, c, d, e] => t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64) -> i64>(code)(a, b, c, d, e),
-        [a, b, c, d, e, f] => {
-            t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64>(code)(a, b, c, d, e, f)
+/// This bridges host functions — written by the embedder with a plain
+/// `(i64 × arity) -> i64` C ABI — into the context-threading ABI every Blaze
+/// call site uses, so a host function is dispatched exactly like a Blaze one.
+fn compile_host_trampoline(module: &mut JITModule, arity: usize, host_ptr: *const u8) -> *const u8 {
+    let call_conv = module.target_config().default_call_conv;
+    // The trampoline's own signature: (ctx, args…) -> i64, like any Blaze fn.
+    let tramp_sig = clif_signature(arity, call_conv);
+    let func_id = module
+        .declare_anonymous_function(&tramp_sig)
+        .expect("declare host trampoline");
+
+    let mut ctx = module.make_context();
+    ctx.func.signature = tramp_sig;
+    {
+        let mut fb_ctx = FunctionBuilderContext::new();
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+
+        // Params: [ctx, arg0, … arg{arity-1}]. Drop ctx, forward the rest.
+        let params = b.block_params(entry).to_vec();
+        let real_args = &params[1..];
+
+        // The host function's real signature has no context pointer.
+        let mut host_sig = ClifSig::new(call_conv);
+        for _ in 0..arity {
+            host_sig.params.push(AbiParam::new(types::I64));
         }
-        [a, b, c, d, e, f, g] => {
-            t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64, i64, i64) -> i64>(code)(a, b, c, d, e, f, g)
-        }
-        [a, b, c, d, e, f, g, h] => t::<*const u8, extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64>(
-            code,
-        )(a, b, c, d, e, f, g, h),
-        _ => unreachable!("arity checked against MAX_ARITY before dispatch"),
+        host_sig.returns.push(AbiParam::new(types::I64));
+        let host_sig_ref = b.import_signature(host_sig);
+
+        let target = b.ins().iconst(types::I64, host_ptr as i64);
+        let call = b.ins().call_indirect(host_sig_ref, target, real_args);
+        let result = b.inst_results(call)[0];
+        b.ins().return_(&[result]);
+        b.finalize(module.target_config());
     }
+
+    module.define_function(func_id, &mut ctx).expect("define host trampoline");
+    module.clear_context(&mut ctx);
+    module.finalize_definitions().expect("finalize host trampoline");
+    module.get_finalized_function(func_id)
 }
 
 // ---------------------------------------------------------------------------
