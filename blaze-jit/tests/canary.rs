@@ -29,8 +29,18 @@ use blaze_jit::{CanaryPolicy, CanaryVerdict, EditClass, LiveRuntime};
 
 /// A policy that never auto-aborts, so a canary keeps shadowing indefinitely —
 /// the strongest setting for proving the candidate's answer can never leak.
+/// Disables *both* abort paths: divergence, and latency (the default latency
+/// ratio is meant to catch a genuinely slow candidate, but at `sample_every: 1`
+/// every call serializes through the canary's mutex, and on a loaded/shared box
+/// scheduler jitter alone can inflate a shadow call's measured time enough to
+/// trip it — a false abort unrelated to the property these tests check).
 fn never_abort() -> CanaryPolicy {
-    CanaryPolicy { sample_every: 1, max_divergences: u64::MAX, ..Default::default() }
+    CanaryPolicy {
+        sample_every: 1,
+        max_divergences: u64::MAX,
+        min_samples_for_latency: u64::MAX,
+        max_latency_ratio: f64::INFINITY,
+    }
 }
 
 #[test]
