@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -266,6 +266,51 @@ pub struct ReloadReport {
     pub diagnostics: Vec<(String, Diagnostic)>,
 }
 
+/// One entry in the [`LiveRuntime`]'s reload journal — a durable record of a
+/// single reload event and the program state it produced.
+///
+/// The journal is the runtime's audit log *and* the substrate for
+/// [`LiveRuntime::rollback`]: because each committed entry retains the exact
+/// source it installed, reverting to any past generation is just a reload of
+/// that stored source, classified and committed by the same protocol as any
+/// other edit. Every event is recorded — including `Rejected` (with its
+/// diagnostics) and `NoEffect` — so the log is a faithful history, not only a
+/// list of successes.
+#[derive(Debug, Clone)]
+pub struct JournalEntry {
+    /// Monotonic event index across all reload attempts (0 is the initial load).
+    pub sequence: usize,
+    /// The generation in effect after this event. A `Rejected` or `NoEffect`
+    /// event commits nothing, so it carries the *previous* generation number;
+    /// a committed event carries its own, unique, increasing number.
+    pub generation: usize,
+    /// When the event was recorded.
+    pub at: SystemTime,
+    /// The full program source as of this event — the snapshot `rollback`
+    /// reinstalls. (Kept verbatim; live-logic sources are small and edits few.)
+    pub source: String,
+    /// How the event was classified.
+    pub class: EditClass,
+    /// The blast radius: functions whose DevIR changed.
+    pub changed: Vec<String>,
+    /// Functions this event added.
+    pub added: Vec<String>,
+    /// Functions this event removed.
+    pub removed: Vec<String>,
+    /// Diagnostics proved for this event (non-empty iff `class == Rejected`).
+    pub diagnostics: Vec<(String, Diagnostic)>,
+    /// Wall-clock time the event took.
+    pub latency: Duration,
+}
+
+impl JournalEntry {
+    /// Whether this event actually installed a generation (i.e. is a valid
+    /// [`LiveRuntime::rollback`] target). `Rejected` and `NoEffect` did not.
+    pub fn is_committed(&self) -> bool {
+        !matches!(self.class, EditClass::Rejected | EditClass::NoEffect)
+    }
+}
+
 /// A Blaze value crossing the host boundary: an `int` or a `float`.
 ///
 /// Inside generated code every value is carried as a raw 64-bit pattern (see
@@ -391,6 +436,47 @@ impl FuncHandle {
 }
 
 // ---------------------------------------------------------------------------
+// Per-function metrics
+// ---------------------------------------------------------------------------
+
+/// Lock-free execution counters for one function, indexed by its stable slot.
+///
+/// Updated on the call path *only while metrics are enabled* (a single relaxed
+/// flag load gates every write), so the fast path pays nothing by default. Every
+/// field is a plain relaxed atomic: counts can never be lost or torn under
+/// concurrent callers, and collection scales with the call path itself — no lock
+/// is ever taken to record a call.
+#[derive(Debug, Default)]
+struct FnMetrics {
+    calls: AtomicU64,
+    total_nanos: AtomicU64,
+    faults: AtomicU64,
+}
+
+/// A point-in-time read of one function's execution counters
+/// ([`LiveRuntime::metrics`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FnMetricsSnapshot {
+    /// Calls that ran to a result or a trap while metrics were enabled.
+    pub calls: u64,
+    /// Summed wall-clock execution time across those calls, in nanoseconds.
+    pub total_nanos: u64,
+    /// Calls that aborted with a resource/fuel trap (a subset of `calls`).
+    pub faults: u64,
+}
+
+impl FnMetricsSnapshot {
+    /// Mean execution time per recorded call, in nanoseconds (0 if none).
+    pub fn mean_nanos(&self) -> u64 {
+        if self.calls == 0 {
+            0
+        } else {
+            self.total_nanos / self.calls
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The runtime
 // ---------------------------------------------------------------------------
 
@@ -432,6 +518,9 @@ struct LiveInner {
     /// functions only*) is negligible by design.
     generations: Vec<JITModule>,
     generation: usize,
+    /// Append-only log of every reload event, oldest first. The audit trail and
+    /// the source of truth for [`LiveRuntime::rollback`].
+    journal: Vec<JournalEntry>,
 }
 
 /// An embeddable, hot-swappable Blaze program.
@@ -449,6 +538,12 @@ pub struct LiveRuntime {
     /// call/back-edge spends one unit; exhaustion aborts the call with
     /// [`CallError::FuelExhausted`]. `u64::MAX` disables metering.
     fuel_budget: AtomicU64,
+    /// Whether per-function metrics are being collected. Off by default; a
+    /// single relaxed load on the call path gates all metric writes.
+    metrics_enabled: AtomicBool,
+    /// Per-function execution counters, indexed by slot (stable for the life of
+    /// the runtime, so a function's metrics survive body swaps and relinks).
+    metrics: Box<[FnMetrics]>,
     inner: Mutex<LiveInner>,
 }
 
@@ -473,6 +568,8 @@ impl LiveRuntime {
             table: SwapTable::new()?,
             dispatch: RwLock::new(HashMap::new()),
             fuel_budget: AtomicU64::new(DEFAULT_FUEL_BUDGET),
+            metrics_enabled: AtomicBool::new(false),
+            metrics: (0..TABLE_CAPACITY).map(|_| FnMetrics::default()).collect(),
             inner: Mutex::new(LiveInner {
                 db,
                 src,
@@ -486,6 +583,7 @@ impl LiveRuntime {
                 host_fns: HashMap::new(),
                 generations: Vec::new(),
                 generation: 0,
+                journal: Vec::new(),
             }),
         };
         {
@@ -581,7 +679,7 @@ impl LiveRuntime {
         // context-threading `(*mut CallState, i64 × arity)` signature; the arity
         // was checked against the dispatch table, updated atomically under the
         // same lock held here.
-        unsafe { self.run(code, args) }
+        unsafe { self.run(entry.slot, code, args) }
     }
 
     /// Invoke `name` with *typed* arguments, returning a typed result.
@@ -622,32 +720,54 @@ impl LiveRuntime {
             raw[i] = v.to_abi();
         }
         let ret_ty = entry.sig.ret;
-        let code = self.table.code(entry.slot).load(Ordering::Acquire) as usize as *const u8;
+        let slot = entry.slot;
+        let code = self.table.code(slot).load(Ordering::Acquire) as usize as *const u8;
         // SAFETY: as in `call` — finalized context-threading code, arity checked
         // under the same lock; the raw words carry each value's exact ABI bits.
-        let bits = unsafe { self.run(code, &raw[..args.len()]) }?;
+        let bits = unsafe { self.run(slot, code, &raw[..args.len()]) }?;
         Ok(Value::from_abi(bits, ret_ty))
     }
 
-    /// Allocate this call's state, invoke `code`, and translate a resource trap
-    /// into a typed error. Shared by [`Self::call`] and [`Self::call_handle`].
+    /// Allocate this call's state, invoke `code`, record metrics for `slot` (if
+    /// enabled), and translate a resource trap into a typed error. Shared by
+    /// [`Self::call`], [`Self::call_typed`], and [`Self::call_handle`].
     ///
     /// # Safety
     ///
     /// `code` must point at a finalized function compiled with the
-    /// context-threading signature for exactly `args.len()` arguments.
+    /// context-threading signature for exactly `args.len()` arguments, and
+    /// `slot` must be that function's slot.
     #[inline]
-    unsafe fn run(&self, code: *const u8, args: &[i64]) -> Result<i64, CallError> {
+    unsafe fn run(&self, slot: usize, code: *const u8, args: &[i64]) -> Result<i64, CallError> {
+        // One relaxed load gates all metric work; when metrics are off the call
+        // path pays only this branch (no clock read, no atomic write).
+        let metering = self.metrics_enabled.load(Ordering::Relaxed);
+        let start = if metering { Some(Instant::now()) } else { None };
+
         // Fresh per-call state on this thread's stack — automatically per-thread
         // and per-call, so concurrent callers never share counters. Depth and
         // fuel guards are both active; the fuel budget is read lock-free.
         let mut state = CallState::new(self.fuel_budget.load(Ordering::Relaxed));
         let result = abi::invoke(code, &mut state, args);
-        match state.trap as i64 {
+        let outcome = match state.trap as i64 {
             TRAP_STACK => Err(CallError::ResourceExhausted),
             TRAP_FUEL => Err(CallError::FuelExhausted),
             _ => Ok(result),
+        };
+
+        if metering {
+            // Lock-free, relaxed: counts can't be lost or torn under concurrent
+            // callers, and a body swap doesn't disturb them (the slot is stable).
+            let m = &self.metrics[slot];
+            m.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(started) = start {
+                m.total_nanos.fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            if outcome.is_err() {
+                m.faults.fetch_add(1, Ordering::Relaxed);
+            }
         }
+        outcome
     }
 
     /// Resolve `name` to a reusable [`FuncHandle`] once, so subsequent calls can
@@ -708,7 +828,7 @@ impl LiveRuntime {
                 if a2 == handle.arity as u64 {
                     // SAFETY: `code` is finalized code compiled for exactly
                     // `handle.arity` arguments, which equals `args.len()`.
-                    return unsafe { self.run(code, args) };
+                    return unsafe { self.run(handle.slot, code, args) };
                 }
             }
             // The slot's arity differs from the handle (a relink changed the
@@ -776,6 +896,80 @@ impl LiveRuntime {
         self.fuel_budget.store(budget, Ordering::Relaxed);
     }
 
+    /// Turn per-function metrics collection on or off. Off by default: the call
+    /// path then pays only a single relaxed flag load, so the throughput numbers
+    /// hold. When on, every call records its count, wall-clock latency, and
+    /// whether it faulted — all through lock-free atomics that scale with the
+    /// call path. Read them with [`Self::metrics`].
+    pub fn set_metrics_enabled(&self, on: bool) {
+        self.metrics_enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// A snapshot of `name`'s execution counters, or `None` if the runtime has
+    /// no such function. The read is off the hot path (it resolves the slot
+    /// under the dispatch read lock, then loads relaxed atomics), so gathering
+    /// metrics never blocks or slows the calls being measured.
+    pub fn metrics(&self, name: &str) -> Option<FnMetricsSnapshot> {
+        let slot = self.dispatch.read().unwrap().get(name).map(|e| e.slot)?;
+        let m = &self.metrics[slot];
+        Some(FnMetricsSnapshot {
+            calls: m.calls.load(Ordering::Relaxed),
+            total_nanos: m.total_nanos.load(Ordering::Relaxed),
+            faults: m.faults.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Zero every function's counters — e.g. to start a fresh measurement
+    /// window. Racing with in-flight calls is safe (each field is atomic); a
+    /// call landing mid-reset is simply counted in the new window.
+    pub fn reset_metrics(&self) {
+        for m in self.metrics.iter() {
+            m.calls.store(0, Ordering::Relaxed);
+            m.total_nanos.store(0, Ordering::Relaxed);
+            m.faults.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// The reload journal: every reload event so far, oldest first — the audit
+    /// trail of what changed, how it was classified, its blast radius, its
+    /// diagnostics, and its latency. Committed entries also carry the exact
+    /// source they installed (the snapshot [`Self::rollback`] reinstalls).
+    pub fn journal(&self) -> Vec<JournalEntry> {
+        self.inner.lock().unwrap().journal.clone()
+    }
+
+    /// Revert the program to the source that produced a past `generation`.
+    ///
+    /// Rollback is **not** a special code path: it reinstalls the stored source
+    /// of that generation and runs it through the ordinary reload protocol, so
+    /// the revert is itself classified (`SafeSwap` / `Relink` / `NoEffect`),
+    /// committed with exactly the synchronization that class proves sound, and
+    /// journaled as a new event. Because that source was already accepted once —
+    /// and host functions are only ever added — a rollback to a committed
+    /// generation can never be `Rejected`.
+    ///
+    /// `generation` must be a committed generation number seen in the
+    /// [`Self::journal`] (the initial load is generation 1). A `Rejected` or
+    /// `NoEffect` event installed nothing and is not a valid target.
+    pub fn rollback(&self, generation: usize) -> Result<ReloadReport, String> {
+        let started = Instant::now();
+        let mut inner = self.inner.lock().unwrap();
+        let source = inner
+            .journal
+            .iter()
+            .find(|e| e.generation == generation && e.is_committed())
+            .map(|e| e.source.clone())
+            .ok_or_else(|| {
+                format!(
+                    "no committed generation {generation} to roll back to (current generation is {})",
+                    inner.generation
+                )
+            })?;
+        let src = inner.src;
+        src.set_text(&mut inner.db).to(source);
+        self.load_generation(&mut inner, Some(started))
+    }
+
     /// Enable query-execution tracing on the underlying database (testing:
     /// proves which queries re-ran during a reload).
     pub fn enable_tracing(&self) -> ExecTrace {
@@ -807,6 +1001,9 @@ impl LiveRuntime {
     ) -> Result<ReloadReport, String> {
         let src = inner.src;
         let host = inner.host_functions;
+        // The exact source this event installs (or rejects) — journaled with
+        // every outcome so `rollback` can reinstall any past generation.
+        let source_text = src.text(&inner.db).to_string();
 
         // 0. THE GATE. Before touching anything live, ask the query graph to
         //    prove the whole program is free of statically-detectable defects
@@ -818,7 +1015,7 @@ impl LiveRuntime {
         //    no "previous generation" to hold on the very first load.
         let diags = program_diagnostics(&inner.db, src, host);
         if !diags.is_empty() {
-            return Ok(ReloadReport {
+            let report = ReloadReport {
                 class: EditClass::Rejected,
                 changed: Vec::new(),
                 added: Vec::new(),
@@ -826,7 +1023,8 @@ impl LiveRuntime {
                 diagnostics: diags.as_ref().clone(),
                 latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
                 generation: inner.generation,
-            });
+            };
+            return Ok(Self::record_event(inner, &source_text, report));
         }
 
         // 1. Demand the whole program through the query graph. Unchanged
@@ -874,7 +1072,7 @@ impl LiveRuntime {
 
         let is_initial = edit_started.is_none();
         if changed.is_empty() && removed.is_empty() && !is_initial {
-            return Ok(ReloadReport {
+            let report = ReloadReport {
                 class: EditClass::NoEffect,
                 changed: Vec::new(),
                 added: Vec::new(),
@@ -882,7 +1080,8 @@ impl LiveRuntime {
                 diagnostics: Vec::new(),
                 latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
                 generation: inner.generation,
-            });
+            };
+            return Ok(Self::record_event(inner, &source_text, report));
         }
 
         let class = if signature_changed || !removed.is_empty() {
@@ -1005,7 +1204,7 @@ impl LiveRuntime {
         inner.generation += 1;
         inner.prev = current.into_iter().collect();
 
-        Ok(ReloadReport {
+        let report = ReloadReport {
             class: if is_initial { EditClass::SafeSwap } else { class },
             changed: changed.iter().map(|(n, _)| n.clone()).collect(),
             added,
@@ -1013,7 +1212,26 @@ impl LiveRuntime {
             diagnostics: Vec::new(),
             latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
             generation: inner.generation,
-        })
+        };
+        Ok(Self::record_event(inner, &source_text, report))
+    }
+
+    /// Append a reload event to the journal and return the report unchanged.
+    /// The journaled snapshot is what [`Self::rollback`] reinstalls.
+    fn record_event(inner: &mut LiveInner, source: &str, report: ReloadReport) -> ReloadReport {
+        inner.journal.push(JournalEntry {
+            sequence: inner.journal.len(),
+            generation: report.generation,
+            at: SystemTime::now(),
+            source: source.to_string(),
+            class: report.class,
+            changed: report.changed.clone(),
+            added: report.added.clone(),
+            removed: report.removed.clone(),
+            diagnostics: report.diagnostics.clone(),
+            latency: report.latency,
+        });
+        report
     }
 }
 

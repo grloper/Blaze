@@ -110,12 +110,15 @@ guarantee with a test hammering it from a second thread:
 | A float body edit hot-swaps live under a second thread, torn-free | `floats.rs::float_body_swap_is_sound_under_concurrent_execution` |
 | Retyping a parameter `int`↔`float` is a `Relink`, atomic under a second thread | `floats.rs::retyping_a_parameter_relinks_atomically_under_fire` — every observation is fully-old float or fully-new int, decoded by the matching return type |
 | A type mismatch is proven and `Rejected`, never a silent bit-reinterpretation | `blaze-ir` `diag::tests::mixed_arithmetic_is_rejected` (+ wrong-typed return, assignment, argument, and bare-float condition) |
+| Per-function metrics are exact under concurrent callers, lock-free | `metrics.rs::counts_are_exact_under_concurrent_callers` — four threads hammer one slot; every increment lands |
+| Every reload (incl. `Rejected`/`NoEffect`) is journaled with its class, radius, diagnostics, and latency | `journal.rs::every_event_is_journaled_in_order` + `rejected_events_are_journaled_but_not_committed` |
+| `rollback(gen)` reverts through the same swap protocol, torn-free under a second thread | `journal.rs::rollback_reverts_a_body_edit` + `rollback_is_sound_under_concurrent_execution` (Relink variant: `rollback_across_an_abi_change_is_a_relink`) |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 79 tests
+cargo test --workspace                                  # 95 tests
 cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
 cargo run -p blaze-jit --release --example bench_reload  # reload latency per edit class
 cargo run -p blaze-jit --release --example bench_calls   # call throughput (named vs handle)
@@ -148,6 +151,14 @@ unsafe { rt.register_host_fn("now_ms", 0, now_ms as *const u8) };
 let report = rt.reload("int add(int a, int b) { return a + a + b; }")?;
 assert_eq!(report.class, blaze_jit::EditClass::SafeSwap);
 assert_eq!(report.changed, vec!["add".to_string()]);
+
+// Observe (opt-in, lock-free) and revert. Rollback replays a past generation's
+// source through the same classified, provably-safe swap protocol.
+rt.set_metrics_enabled(true);
+rt.call("add", &[2, 3])?;
+let m = rt.metrics("add").unwrap();          // calls, total_nanos, faults
+let _ = rt.rollback(1)?;                       // back to generation 1, classified
+assert_eq!(rt.call("add", &[2, 3]), Ok(5));
 
 // Or bind to a file and poll once per frame:
 let mut host = ScriptHost::new("game/logic.blaze")?;
@@ -269,11 +280,18 @@ because nothing on it is shared.
   firewall classifies as a `Relink`, atomic even under concurrent calls. Floats
   reach the host through a typed `Value` API (`call_typed` / `call_handle_typed`)
 - ✅ Terminal live demo + scripted CI-safe mode + reload & call benchmarks
+- ✅ **Per-function metrics**: opt-in, lock-free call/latency/fault counters
+  indexed by a function's stable slot (so they survive hot swaps). Off by
+  default — the call path pays one relaxed flag load — and exact under
+  concurrent callers. Read them with `metrics(name)`
+- ✅ **Reload journal + `rollback()`**: every reload event (including
+  `Rejected` and `NoEffect`) is recorded with its class, blast radius,
+  diagnostics, latency, and the exact source it installed. `rollback(gen)` is
+  not a special path — it reinstalls that generation's source through the
+  ordinary reload protocol, so a revert is itself classified, committed with
+  the synchronization its class proves sound, and journaled as a new event
 - 🔜 In-process canary: mirror live traffic through a candidate generation
   before promoting it, with an auto-abort policy
-- 🔜 Generation journal + `rollback()`: every reload's source, class, and
-  blast radius persisted; reverting is just another classified, provably-safe
-  swap
 - 🔜 Richer types and explicit `int`↔`float` conversions (pure language growth;
   reload semantics unchanged)
 - 🔜 `StateMigration`: script-owned persistent state with layout versioning
