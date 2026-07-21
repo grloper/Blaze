@@ -20,8 +20,8 @@ use std::collections::HashMap;
 use cranelift_codegen::control::ControlPlane;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
-    types, AbiParam, ExtFuncData, ExternalName, InstBuilder, MemFlagsData, Signature as ClifSig,
-    UserExternalName, UserFuncName, Value,
+    types, AbiParam, Block, ExtFuncData, ExternalName, InstBuilder, MemFlagsData,
+    Signature as ClifSig, UserExternalName, UserFuncName, Value,
 };
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa, TargetIsa};
 use cranelift_codegen::settings::{self, Configurable};
@@ -30,7 +30,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 
 use blaze_ir::{CmpKind, FunctionId, FunctionNode, IrOp};
 
-use crate::abi::{OFF_DEPTH, OFF_TRAP, TRAP_STACK};
+use crate::abi::{OFF_DEPTH, OFF_FUEL, OFF_TRAP, TRAP_FUEL, TRAP_STACK};
 
 /// Build a Cranelift target ISA for the host machine.
 ///
@@ -102,6 +102,13 @@ pub trait CallEmitter {
 /// prologue that would exceed it records [`TRAP_STACK`] in the context and
 /// returns `0` instead of recursing, so unbounded recursion can never fault
 /// the host. The runtime turns that trap into `Err(ResourceExhausted)`.
+///
+/// Fuel metering (H3) is also emitted here: each call and each loop back-edge
+/// spends one unit of the context's fuel, trapping with [`TRAP_FUEL`] when it
+/// runs out. That bounds *both* runaway loops (which spin on back-edges) and
+/// shallow-but-explosive recursion (e.g. naive `fib`, which never trips the
+/// depth guard but makes exponentially many calls). The budget lives in the
+/// context, so `u64::MAX` disables metering with no code change.
 pub fn build_body(
     builder: &mut FunctionBuilder,
     node: &FunctionNode,
@@ -171,6 +178,9 @@ pub fn build_body(
     builder.ins().return_(&[zero]);
 
     builder.switch_to_block(body_start);
+    // The shared "out of fuel" landing pad, created lazily on the first call or
+    // back-edge (a leaf function with neither pays no fuel cost at all).
+    let mut out_of_fuel: Option<Block> = None;
     let mut terminated = false;
     for op in &node.body {
         // Skip straight-line ops that lowering placed nowhere reachable; only a
@@ -223,6 +233,10 @@ pub fn build_body(
                 builder.def_var(vars[*dst as usize], v);
             }
             IrOp::Call(dst, callee, args) => {
+                // Spend fuel before every call — this is what bounds recursion
+                // that stays under the depth limit but explodes in call count.
+                let oof = ensure_block(builder, &mut out_of_fuel);
+                emit_fuel_check(builder, ctx_var, flags, oof);
                 let ctx = builder.use_var(ctx_var);
                 let arg_values: Vec<Value> =
                     args.iter().map(|r| builder.use_var(vars[*r as usize])).collect();
@@ -235,6 +249,11 @@ pub fn build_body(
                 terminated = true;
             }
             IrOp::Jump(label) => {
+                // Spend fuel on every jump. Forward jumps (if/else joins) cost
+                // a unit too — harmless — but crucially every loop's back-edge
+                // is a jump, so a runaway `while` cannot spin for free.
+                let oof = ensure_block(builder, &mut out_of_fuel);
+                emit_fuel_check(builder, ctx_var, flags, oof);
                 builder.ins().jump(blocks[label], &[]);
                 terminated = true;
             }
@@ -267,7 +286,56 @@ pub fn build_body(
         emit_return(builder, ctx_var, flags, zero);
     }
 
+    // Populate the fuel-exhaustion landing pad if any call or jump referenced
+    // it: record the trap, unwind this frame's depth, and return a defined 0.
+    if let Some(oof) = out_of_fuel {
+        builder.switch_to_block(oof);
+        let ctx = builder.use_var(ctx_var);
+        let trap_code = builder.ins().iconst(types::I64, TRAP_FUEL);
+        builder.ins().store(flags, trap_code, ctx, OFF_TRAP);
+        let depth = builder.ins().load(types::I64, flags, ctx, OFF_DEPTH);
+        let one = builder.ins().iconst(types::I64, 1);
+        let depth_dec = builder.ins().isub(depth, one);
+        builder.ins().store(flags, depth_dec, ctx, OFF_DEPTH);
+        let zero = builder.ins().iconst(types::I64, 0);
+        builder.ins().return_(&[zero]);
+    }
+
     builder.seal_all_blocks();
+}
+
+/// Get `slot`'s block, creating it on first use.
+fn ensure_block(builder: &mut FunctionBuilder, slot: &mut Option<Block>) -> Block {
+    match *slot {
+        Some(b) => b,
+        None => {
+            let b = builder.create_block();
+            *slot = Some(b);
+            b
+        }
+    }
+}
+
+/// Spend one unit of fuel: if the context's budget is already zero, branch to
+/// the `out_of_fuel` landing pad; otherwise decrement it and fall through. On
+/// return the builder is positioned in the fall-through (fuel-available) block,
+/// ready for the caller to emit the call or jump this guards.
+fn emit_fuel_check(
+    builder: &mut FunctionBuilder,
+    ctx_var: Variable,
+    flags: MemFlagsData,
+    out_of_fuel: Block,
+) {
+    let ctx = builder.use_var(ctx_var);
+    let fuel = builder.ins().load(types::I64, flags, ctx, OFF_FUEL);
+    let empty = builder.ins().icmp_imm_s(IntCC::Equal, fuel, 0);
+    let has_fuel = builder.create_block();
+    builder.ins().brif(empty, out_of_fuel, &[], has_fuel, &[]);
+
+    builder.switch_to_block(has_fuel);
+    let one = builder.ins().iconst(types::I64, 1);
+    let fuel_dec = builder.ins().isub(fuel, one);
+    builder.ins().store(flags, fuel_dec, ctx, OFF_FUEL);
 }
 
 /// Emit a normal function return, first dropping the call-depth counter so the

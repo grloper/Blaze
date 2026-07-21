@@ -18,6 +18,10 @@
 //! | Unbounded recursion aborts the call, never faults the host   | [`unbounded_recursion_aborts_with_error_not_a_crash`] |
 //! | The depth guard does not false-positive on real recursion    | [`deep_but_bounded_recursion_succeeds`] |
 //! | Mutual recursion is bounded too                              | [`mutual_recursion_is_also_bounded`] |
+//! | An infinite loop aborts with `FuelExhausted`, not a hang      | [`infinite_loop_aborts_with_fuel_exhausted`] |
+//! | A runaway can't permanently block a reload (the un-wedge)     | [`relink_commits_after_a_runaway_loop_traps`] |
+//! | Fuel bounds shallow-but-explosive recursion depth can't       | [`exponential_recursion_is_bounded_by_fuel`] |
+//! | Fuel doesn't false-positive real loops; can be disabled       | [`legitimate_loops_run_under_fuel`] |
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -481,4 +485,137 @@ int rec(int n) {
     // stays under it still succeeds.
     assert_eq!(runtime.call("rec", &[100]), Err(CallError::ResourceExhausted));
     assert_eq!(runtime.call("rec", &[3]), Ok(3));
+}
+
+// --- H3: fuel metering -----------------------------------------------------
+//
+// The depth guard bounds recursion, but not a loop. Before fuel, `while(1){}`
+// hung the calling thread forever — and, because a call holds the dispatch
+// read lock for its whole duration, it also permanently blocked every future
+// reload that needs the write lock (a Relink). The runtime was wedgeable by a
+// single bad edit. Fuel metering — one unit spent per call and per loop
+// back-edge — turns any runaway into a bounded, defined `FuelExhausted` error.
+
+const RUNAWAY: &str = "\
+int runaway() {
+    int x = 0;
+    while (1) {
+        x = x + 1;
+    }
+    return x;
+}
+
+int add(int a, int b) {
+    return a + b;
+}
+";
+
+#[test]
+fn infinite_loop_aborts_with_fuel_exhausted() {
+    let runtime = LiveRuntime::new(RUNAWAY).expect("compile");
+    // Tighten the budget so the runaway trips it near-instantly.
+    runtime.set_fuel_budget(100_000);
+
+    assert_eq!(
+        runtime.call("runaway", &[]),
+        Err(CallError::FuelExhausted),
+        "an infinite loop must abort with a defined error, not hang",
+    );
+    // The runtime is completely healthy afterward — a runaway loop leaves no
+    // residue (fuel is reset per call).
+    assert_eq!(runtime.call("add", &[2, 3]), Ok(5));
+    assert_eq!(runtime.call("runaway", &[]), Err(CallError::FuelExhausted));
+    assert_eq!(runtime.call("add", &[10, 20]), Ok(30));
+}
+
+#[test]
+fn relink_commits_after_a_runaway_loop_traps() {
+    // The un-wedge, and the headline reason fuel exists: a thread stuck in a
+    // runaway loop holds the dispatch read lock, so a Relink (which needs the
+    // write lock) blocks on it. Fuel guarantees the runaway *ends*, so the
+    // Relink always eventually commits — the runtime can never be permanently
+    // wedged by a bad edit.
+    let runtime = Arc::new(LiveRuntime::new(RUNAWAY).expect("compile"));
+    // A budget large enough to keep the runaway spinning for a beat (so the
+    // reload genuinely contends for the lock), but bounded so it must end.
+    runtime.set_fuel_budget(30_000_000);
+
+    let spinner = {
+        let runtime = runtime.clone();
+        thread::spawn(move || runtime.call("runaway", &[]))
+    };
+    // Give the spinner time to be deep in its loop, holding the read lock.
+    thread::sleep(Duration::from_millis(20));
+
+    // Submit an ABI-changing reload — a Relink, which must take the dispatch
+    // write lock. This blocks until the runaway exhausts its fuel and releases
+    // the read lock, then commits. Before fuel, this call would hang forever.
+    let started = Instant::now();
+    let report = runtime
+        .reload(
+            "int runaway() { int x = 0; while (1) { x = x + 1; } return x; }\n\
+             int add(int a, int b, int c) { return a + b + c; }\n",
+        )
+        .expect("reload must eventually succeed, not deadlock");
+    assert_eq!(report.class, EditClass::Relink);
+    assert!(started.elapsed() < Duration::from_secs(30), "the reload must not hang");
+
+    // The runaway ended on its own, with a defined error.
+    assert_eq!(
+        spinner.join().expect("spinner thread must not panic"),
+        Err(CallError::FuelExhausted),
+    );
+    // And the relinked program works.
+    assert_eq!(runtime.call("add", &[1, 2, 3]), Ok(6));
+}
+
+#[test]
+fn exponential_recursion_is_bounded_by_fuel() {
+    // Naive fib recurses only `n` deep — far under the depth limit — but makes
+    // exponentially many calls. The depth guard can't catch it; fuel can,
+    // because every call spends a unit.
+    let src = "\
+int fib(int n) {
+    if (n < 2) {
+        return n;
+    }
+    return fib(n - 1) + fib(n - 2);
+}
+";
+    let runtime = LiveRuntime::new(src).expect("compile");
+    runtime.set_fuel_budget(1_000_000);
+
+    // fib(10) makes only ~177 calls — well under budget — so it computes.
+    assert_eq!(runtime.call("fib", &[10]), Ok(55));
+    // fib(40) makes ~3x10^8 calls at depth only 40: the depth guard never fires
+    // (40 << 256), but fuel does.
+    assert_eq!(
+        runtime.call("fib", &[40]),
+        Err(CallError::FuelExhausted),
+        "explosive shallow recursion must be bounded by fuel",
+    );
+}
+
+#[test]
+fn legitimate_loops_run_under_fuel() {
+    // A real bounded loop must run to completion under the default budget (no
+    // false positives), and disabling fuel must also let it run.
+    let src = "\
+int sum_to(int n) {
+    int i = 0;
+    int acc = 0;
+    while (i < n) {
+        acc = acc + i;
+        i = i + 1;
+    }
+    return acc;
+}
+";
+    let runtime = LiveRuntime::new(src).expect("compile");
+    // 1000 iterations under the generous default budget: computes 0+1+…+999.
+    assert_eq!(runtime.call("sum_to", &[1000]), Ok(499_500));
+
+    // Explicitly disabling fuel leaves the same call correct.
+    runtime.set_fuel_budget(u64::MAX);
+    assert_eq!(runtime.call("sum_to", &[1000]), Ok(499_500));
 }
