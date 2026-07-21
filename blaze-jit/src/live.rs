@@ -823,8 +823,26 @@ impl LiveRuntime {
     /// [`Self::new`], but the primary's host functions are registered *before*
     /// the first load so a candidate that calls them is not spuriously rejected.
     /// A candidate that is genuinely defective returns its diagnostics as `Err`.
-    fn new_candidate(source: &str, host_fns: &HashMap<String, (usize, u64)>) -> Result<Self, String> {
+    ///
+    /// The candidate is stood up under the primary's *current* resource limits —
+    /// its call-depth limit (baked into the entry guards at compile time) and its
+    /// per-call fuel budget — so the shadow evaluates the candidate under exactly
+    /// the production conditions it would face if promoted. A candidate whose new
+    /// logic recurses or loops away thus traps on the *same* budget the live
+    /// program enforces, and the divergence is caught here rather than after it
+    /// ships.
+    fn new_candidate(
+        source: &str,
+        host_fns: &HashMap<String, (usize, u64)>,
+        max_depth: u64,
+        fuel_budget: u64,
+    ) -> Result<Self, String> {
         let runtime = Self::assemble(source)?;
+        // Fuel is read per call, so setting it now covers every shadow call.
+        runtime.fuel_budget.store(fuel_budget, Ordering::Relaxed);
+        // The depth limit is compiled into the entry guards, so it must be set
+        // *before* the load below builds the candidate's code.
+        runtime.inner.lock().unwrap().max_depth = max_depth;
         for (name, (arity, ptr)) in host_fns {
             // SAFETY: each pointer came from a valid registration on the primary
             // and must (by that call's contract) outlive the primary — which
@@ -1224,9 +1242,15 @@ impl LiveRuntime {
     /// [`Self::abort_canary`] it first.
     pub fn canary(&self, new_source: &str, policy: CanaryPolicy) -> Result<(), String> {
         // The candidate must know the primary's host functions, or the gate
-        // would reject any call to them as undefined.
-        let host_fns = self.inner.lock().unwrap().host_fns.clone();
-        let program = Self::new_candidate(new_source, &host_fns)?;
+        // would reject any call to them as undefined; and it inherits the
+        // primary's live resource limits so the shadow runs under production
+        // conditions (a runaway candidate traps on the same budget it would
+        // face if promoted).
+        let (host_fns, max_depth, fuel_budget) = {
+            let inner = self.inner.lock().unwrap();
+            (inner.host_fns.clone(), inner.max_depth, self.fuel_budget.load(Ordering::Relaxed))
+        };
+        let program = Self::new_candidate(new_source, &host_fns, max_depth, fuel_budget)?;
 
         let mut guard = self.canary.lock().unwrap();
         if guard.is_some() {

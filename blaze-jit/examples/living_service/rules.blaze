@@ -1,0 +1,40 @@
+// The live risk model for the living_service demo. Edit and save while
+// `cargo run --example living_service` is running: every save is classified by
+// the firewall and applied to the running service without dropping a request.
+//
+// Things to try, in escalating order of magic:
+//   1. Retune a weight (velocity * 5 -> * 8)     -> SafeSwap: one atomic store
+//   2. Add a comment anywhere                    -> NoEffect: proven a no-op
+//   3. Introduce a typo (velocity -> velcty)     -> Rejected: last-good serves on
+//   4. Give velocity_risk a second parameter and -> Relink: caller pulled in,
+//      pass it from score(...)                       committed atomically
+//
+//   amount   — transaction size, in cents
+//   velocity — the account's transactions in the last hour
+//   age      — the account's age, in days
+// Returns a risk score; the host declines the charge above its threshold.
+
+int amount_risk(int amount) {
+    if (amount > 100000) {
+        return 45;
+    }
+    if (amount > 10000) {
+        return 20;
+    }
+    return 0;
+}
+
+int velocity_risk(int velocity) {
+    return velocity * 5;
+}
+
+int age_risk(int age) {
+    if (age < 30) {
+        return 25;
+    }
+    return 0;
+}
+
+int score(int amount, int velocity, int age) {
+    return amount_risk(amount) + velocity_risk(velocity) + age_risk(age);
+}

@@ -12,6 +12,7 @@
 //! | A wrong candidate auto-aborts on divergence                  | [`a_diverging_candidate_auto_aborts`] |
 //! | A faulting candidate is a divergence and auto-aborts         | [`a_faulting_candidate_auto_aborts`] |
 //! | A too-slow candidate auto-aborts on latency                  | [`a_slow_candidate_auto_aborts_on_latency`] |
+//! | A runaway candidate traps on the primary's fuel budget        | [`a_runaway_candidate_traps_under_the_primary_fuel_budget`] |
 //! | A matching candidate stays healthy and can be promoted       | [`a_matching_candidate_promotes_through_the_swap_protocol`] |
 //! | Promotion is seamless under concurrent traffic               | [`promote_is_seamless_under_concurrent_traffic`] |
 //! | An auto-aborted candidate cannot be promoted                 | [`an_aborted_candidate_cannot_be_promoted`] |
@@ -143,6 +144,38 @@ fn a_slow_candidate_auto_aborts_on_latency() {
     let st = rt.canary_status().expect("active");
     assert_eq!(st.verdict, CanaryVerdict::AbortedOnLatency, "status: {st:?}");
     assert_eq!(st.divergences, 0, "results matched — only latency failed");
+}
+
+#[test]
+fn a_runaway_candidate_traps_under_the_primary_fuel_budget() {
+    // A canary must evaluate a candidate under the *live program's* resource
+    // limits, so a change that loops away is caught by the shadow instead of
+    // shipping. The candidate inherits the primary's fuel budget; here we pin it
+    // tight so the runaway traps near-instantly (and the test never hangs).
+    let rt = LiveRuntime::new("int score(int x) { return x + x; }\n").expect("compile");
+    rt.set_fuel_budget(200_000);
+
+    // The candidate loops forever. It never touches the live pointers — but when
+    // mirrored, it burns the inherited budget and traps `FuelExhausted`, which is
+    // a divergence (Err vs the live Ok) and a candidate fault.
+    let runaway = "int score(int x) { int i = 0; while (i >= 0) { i = i + 1; } return x; }\n";
+    let before = Instant::now();
+    rt.canary(runaway, CanaryPolicy::default()).expect("start canary");
+
+    // The caller still gets the healthy live answer, and the shadow trap folds
+    // into the tally as a fault + divergence, auto-aborting the canary.
+    assert_eq!(rt.call_canary("score", &[5]), Ok(10), "the caller gets the live result");
+    let st = rt.canary_status().expect("active");
+    assert_eq!(st.candidate_faults, 1, "the runaway candidate trapped");
+    assert_eq!(st.divergences, 1);
+    assert_eq!(st.verdict, CanaryVerdict::AbortedOnDivergence);
+    // The whole thing — compile + shadow trap — stays well under a second because
+    // the candidate ran on the tight inherited budget, not the generous default.
+    assert!(before.elapsed() < Duration::from_secs(5), "the runaway shadow must trap promptly");
+
+    // The live program is untouched and still healthy.
+    assert_eq!(rt.call("score", &[9]), Ok(18));
+    assert!(rt.promote().is_err(), "an auto-aborted runaway cannot be promoted");
 }
 
 #[test]
