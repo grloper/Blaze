@@ -10,7 +10,11 @@
 //! | ABI edit is classified `Relink` and commits atomically       | [`signature_edit_relinks_atomically_under_fire`] |
 //! | Comment/formatting edit is proven `NoEffect` (zero codegen)  | [`comment_edit_is_proven_no_effect`] |
 //! | Host functions dispatch through the same swap table          | [`host_functions_are_callable_and_hot_swappable`] |
-//! | Undefined callees are memory-safe (missing stub)             | [`undefined_callee_is_memory_safe`] |
+//! | A syntax error is `Rejected`; last-good keeps serving        | [`syntax_error_holds_last_good_under_concurrent_execution`] |
+//! | An undefined callee never reaches a live process (H1)        | [`undefined_callee_is_rejected_not_silently_tolerated`] |
+//! | Deleting a still-used function is `Rejected`, not silent 0   | [`removing_a_used_function_is_rejected_and_holds_last_good`] |
+//! | A call-site arity mismatch is `Rejected`, not tolerated      | [`arity_mismatch_is_rejected`] |
+//! | Construction itself fails on a defective initial program     | [`initial_load_with_a_defect_fails_construction`] |
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -219,17 +223,79 @@ fn host_functions_are_callable_and_hot_swappable() {
     assert_eq!(runtime.call("main", &[]), Ok(31));
 }
 
+// --- H1: the diagnostics gate ----------------------------------------------
+//
+// Before this gate existed, every case below was "safe but wrong": an
+// undefined callee silently returned 0, a deleted-but-still-called function
+// silently returned 0, and a syntax error would have hot-swapped mangled
+// semantics into a live process. `reload()` now proves the whole program free
+// of these defects before touching anything live; a proven defect is
+// `Rejected` and the previous, known-good generation keeps serving every
+// call, untouched, for as long as bad edits keep coming in.
+
 #[test]
-fn undefined_callee_is_memory_safe() {
-    // `ghost` is never defined: its slot holds the missing stub, so the call
-    // returns 0 instead of jumping into the void.
-    let src = "int main() { return ghost(1, 2) + 5; }\n";
-    let runtime = LiveRuntime::new(src).expect("compile");
-    assert_eq!(runtime.call("main", &[]), Ok(5));
+fn syntax_error_holds_last_good_under_concurrent_execution() {
+    let runtime = Arc::new(LiveRuntime::new(V1).expect("initial compile"));
+    assert_eq!(runtime.call("main", &[]), Ok(3));
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker = hammer(runtime.clone(), stop.clone());
+    thread::sleep(Duration::from_millis(50));
+
+    // A missing closing brace: caught as a parse error, not a runtime crash.
+    let broken = "int add(int a, int b) {\n    return a + b;\n\nint main() { return add(1, 2); }\n";
+    let report = runtime.reload(broken).expect("reload call itself must not fail");
+
+    assert_eq!(report.class, EditClass::Rejected);
+    assert!(!report.diagnostics.is_empty());
+    assert_eq!(runtime.generation(), 1, "generation must not advance on a rejected edit");
+
+    thread::sleep(Duration::from_millis(50));
+    stop.store(true, Ordering::Relaxed);
+    let seen = worker.join().expect("worker must never panic — bad input must never propagate");
+
+    // Every single concurrent call, before and after the rejected reload,
+    // returned the one correct value. Nothing was ever torn, wrong, or an error.
+    assert!(!seen.is_empty());
+    assert!(seen.iter().all(|v| *v == 3), "a rejected edit must never be observable: {seen:?}");
 }
 
 #[test]
-fn removing_a_function_is_a_relink_and_stays_safe() {
+fn undefined_callee_is_rejected_not_silently_tolerated() {
+    let runtime = LiveRuntime::new(V1).expect("initial compile");
+    let report = runtime
+        .reload("int main() { return ghost(1, 2) + 5; }\n")
+        .expect("reload call itself must not fail");
+
+    assert_eq!(report.class, EditClass::Rejected);
+    assert!(
+        report.diagnostics.iter().any(|(_, d)| d.message.contains("undefined function `ghost`")),
+        "{:?}",
+        report.diagnostics,
+    );
+    // The old program is still exactly what runs.
+    assert_eq!(runtime.call("main", &[]), Ok(3));
+}
+
+#[test]
+fn arity_mismatch_is_rejected() {
+    let runtime = LiveRuntime::new(V1).expect("initial compile");
+    // `add` takes 2 arguments; this call site only supplies 1.
+    let report = runtime
+        .reload("int add(int a, int b) { return a + b; }\nint main() { return add(1); }\n")
+        .expect("reload call itself must not fail");
+
+    assert_eq!(report.class, EditClass::Rejected);
+    assert!(
+        report.diagnostics.iter().any(|(_, d)| d.message.contains("expects 2 argument")),
+        "{:?}",
+        report.diagnostics,
+    );
+    assert_eq!(runtime.call("main", &[]), Ok(3), "last-good keeps serving");
+}
+
+#[test]
+fn removing_a_used_function_is_rejected_and_holds_last_good() {
     let src_two = "\
 int helper(int x) {
     return x * 2;
@@ -239,9 +305,9 @@ int main() {
     return helper(21);
 }
 ";
-    // `helper` deleted while `main` still calls it: the classifier must go
-    // Relink (main's DevIR changes — helper's signature read now defaults),
-    // and the process must keep running with the missing-stub semantics.
+    // Deleting `helper` while `main` still calls it turns `main` into a call
+    // to an undefined function — the same defect as writing it that way from
+    // scratch, and the gate catches it identically: rejected, held open.
     let src_one = "\
 int main() {
     return helper(21);
@@ -250,13 +316,23 @@ int main() {
     let runtime = LiveRuntime::new(src_two).expect("compile");
     assert_eq!(runtime.call("main", &[]), Ok(42));
 
-    let report = runtime.reload(src_one).expect("reload");
-    assert_eq!(report.class, EditClass::Relink);
-    assert_eq!(report.removed, vec!["helper".to_string()]);
-    assert_eq!(runtime.call("main", &[]), Ok(0), "missing stub returns 0");
-    assert_eq!(
-        runtime.call("helper", &[1]),
-        Err(blaze_jit::CallError::UnknownFunction("helper".to_string())),
-        "removed functions leave the dispatch table",
-    );
+    let report = runtime.reload(src_one).expect("reload call itself must not fail");
+    assert_eq!(report.class, EditClass::Rejected);
+    assert!(report.diagnostics.iter().any(|(_, d)| d.message.contains("undefined function `helper`")));
+
+    // Nothing was deleted: both functions still work exactly as before.
+    assert_eq!(runtime.call("main", &[]), Ok(42));
+    assert_eq!(runtime.call("helper", &[10]), Ok(20));
+}
+
+#[test]
+fn initial_load_with_a_defect_fails_construction() {
+    // There is no "last-good" generation to hold on the very first load, so a
+    // proven defect fails construction outright with the diagnostics attached.
+    // (`LiveRuntime` doesn't implement `Debug`, so match rather than `expect_err`.)
+    let err = match LiveRuntime::new("int main() { return undeclared_var; }\n") {
+        Err(e) => e,
+        Ok(_) => panic!("construction must fail, not silently start with wrong semantics"),
+    };
+    assert!(err.contains("undefined variable `undeclared_var`"), "{err}");
 }

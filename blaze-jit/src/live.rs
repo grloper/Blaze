@@ -36,9 +36,10 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 
-use blaze_ir::db::{BlazeDatabaseImpl, ExecTrace, FnKey, SourceProgram};
+use blaze_ir::db::{BlazeDatabaseImpl, ExecTrace, FnKey, HostFunctions, SourceProgram};
+use blaze_ir::diag::{format_diagnostics, program_diagnostics};
 use blaze_ir::lower::{lowered_dev_ir, program_outline};
-use blaze_ir::{FunctionId, FunctionNode};
+use blaze_ir::{Diagnostic, FunctionId, FunctionNode};
 use salsa::Setter;
 
 use crate::codegen::{build_body, clif_signature, host_isa, CallEmitter};
@@ -174,6 +175,13 @@ impl CallEmitter for TableEmitter<'_> {
 /// How an edit may be applied, proved from the query graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditClass {
+    /// The query graph proved a defect before any generation was touched:
+    /// a syntax error, a call to an undefined function, a call-site arity
+    /// mismatch, an undeclared assignment, or a read of an undefined
+    /// variable. Nothing is compiled, nothing is patched, and the previous
+    /// generation keeps serving every in-flight and future call unchanged —
+    /// see [`ReloadReport::diagnostics`] for what was wrong.
+    Rejected,
     /// The edit changed no function's DevIR (formatting, comments, or code
     /// that lowers identically). Nothing is compiled; nothing is patched.
     NoEffect,
@@ -205,8 +213,12 @@ pub struct ReloadReport {
     pub removed: Vec<String>,
     /// Wall-clock time from source swap to fully committed pointers.
     pub latency: Duration,
-    /// Monotonic generation counter (0 is the initial load).
+    /// Monotonic generation counter (0 is the initial load). Unchanged from
+    /// the previous report when `class == Rejected`.
     pub generation: usize,
+    /// Every diagnostic the query graph proved, attributed by function name.
+    /// Non-empty if and only if `class == Rejected`.
+    pub diagnostics: Vec<(String, Diagnostic)>,
 }
 
 /// Why a [`LiveRuntime::call`] could not run.
@@ -247,6 +259,10 @@ struct DispatchEntry {
 struct LiveInner {
     db: BlazeDatabaseImpl,
     src: SourceProgram,
+    /// Salsa input mirroring `host_fns` below, so the diagnostics gate can
+    /// resolve calls to host functions through the same query graph it uses
+    /// for Blaze-defined ones.
+    host_functions: HostFunctions,
     isa: OwnedTargetIsa,
     /// DevIR snapshot of the previous generation, for blast-radius diffing.
     prev: HashMap<String, std::sync::Arc<FunctionNode>>,
@@ -282,6 +298,7 @@ impl LiveRuntime {
     pub fn new(source: &str) -> Result<Self, String> {
         let db = BlazeDatabaseImpl::default();
         let src = SourceProgram::new(&db, source.to_string());
+        let host_functions = HostFunctions::new(&db, std::collections::BTreeMap::new());
         let isa = host_isa()?;
 
         let runtime = LiveRuntime {
@@ -290,6 +307,7 @@ impl LiveRuntime {
             inner: Mutex::new(LiveInner {
                 db,
                 src,
+                host_functions,
                 isa,
                 prev: HashMap::new(),
                 slots: HashMap::new(),
@@ -301,7 +319,13 @@ impl LiveRuntime {
         };
         {
             let mut inner = runtime.inner.lock().unwrap();
-            runtime.load_generation(&mut inner, None)?;
+            // There is no "last-good" to hold on the very first load, so a
+            // proven defect fails construction outright rather than being
+            // reported as a held-open `Rejected` reload.
+            let report = runtime.load_generation(&mut inner, None)?;
+            if report.class == EditClass::Rejected {
+                return Err(format_diagnostics(&report.diagnostics));
+            }
         }
         Ok(runtime)
     }
@@ -321,6 +345,13 @@ impl LiveRuntime {
         let id = blaze_ir::function_id_of(name);
         let slot = Self::ensure_slot(&mut inner, id);
         inner.host_fns.insert(name.to_string(), (arity, ptr as u64));
+
+        // Mirror into the salsa input so the diagnostics gate resolves calls
+        // to this host function exactly like calls to a Blaze-defined one.
+        let mut arities = inner.host_functions.arities(&inner.db).clone();
+        arities.insert(name.to_string(), arity);
+        inner.host_functions.set_arities(&mut inner.db).to(arities);
+
         self.table.slot(slot).store(ptr as u64, Ordering::Release);
         self.dispatch
             .write()
@@ -408,6 +439,28 @@ impl LiveRuntime {
         edit_started: Option<Instant>,
     ) -> Result<ReloadReport, String> {
         let src = inner.src;
+        let host = inner.host_functions;
+
+        // 0. THE GATE. Before touching anything live, ask the query graph to
+        //    prove the whole program is free of statically-detectable defects
+        //    (syntax errors, undefined callees, arity mismatches, undefined
+        //    variables — see `blaze_ir::diag`). A non-empty result means the
+        //    edit is rejected: no generation is compiled, no slot is patched,
+        //    and the previous generation keeps serving every call untouched.
+        //    `LiveRuntime::new` upgrades this into a hard `Err` since there is
+        //    no "previous generation" to hold on the very first load.
+        let diags = program_diagnostics(&inner.db, src, host);
+        if !diags.is_empty() {
+            return Ok(ReloadReport {
+                class: EditClass::Rejected,
+                changed: Vec::new(),
+                added: Vec::new(),
+                removed: Vec::new(),
+                diagnostics: diags.as_ref().clone(),
+                latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
+                generation: inner.generation,
+            });
+        }
 
         // 1. Demand the whole program through the query graph. Unchanged
         //    functions are memo hits; the firewall keeps body edits contained.
@@ -459,6 +512,7 @@ impl LiveRuntime {
                 changed: Vec::new(),
                 added: Vec::new(),
                 removed: Vec::new(),
+                diagnostics: Vec::new(),
                 latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
                 generation: inner.generation,
             });
@@ -581,6 +635,7 @@ impl LiveRuntime {
             changed: changed.iter().map(|(n, _)| n.clone()).collect(),
             added,
             removed,
+            diagnostics: Vec::new(),
             latency: edit_started.map(|t| t.elapsed()).unwrap_or_default(),
             generation: inner.generation,
         })

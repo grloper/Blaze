@@ -31,6 +31,19 @@ pub struct FnKey<'db> {
     pub name: String,
 }
 
+/// Native functions the embedding host has registered, by name → arity.
+///
+/// A `salsa` input (like [`SourceProgram`]) rather than plain runtime state, so
+/// the diagnostics gate (`crate::diag`) can validate calls to host functions
+/// exactly like calls to Blaze-defined ones — unknown-callee and arity checks
+/// see one unified namespace. One instance exists per database, updated via
+/// its `salsa::Setter` whenever the host registers a new function.
+#[salsa::input]
+pub struct HostFunctions {
+    #[returns(ref)]
+    pub arities: std::collections::BTreeMap<String, usize>,
+}
+
 /// A shared, opt-in log of which query *bodies* actually executed.
 ///
 /// Disabled by default (`None`), so production databases pay nothing. Tests

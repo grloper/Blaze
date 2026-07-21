@@ -62,6 +62,7 @@ The live runtime then derives the *swap protocol* from the graph:
 
 | The graph proves…                                | Classification | Commit protocol |
 |--------------------------------------------------|----------------|-----------------|
+| The program has a syntax error, an undefined callee, a call-site arity mismatch, or an undefined variable | `Rejected` | **nothing is compiled or patched — the previous, known-good generation keeps serving every call untouched.** The first load fails construction outright (there's no "previous" to hold) |
 | No function's IR changed                         | `NoEffect`     | nothing compiled, nothing patched |
 | Changed functions all kept their signatures      | `SafeSwap`     | one lock-free atomic pointer store — valid under concurrent execution, because the firewall guarantees no caller's code mentions anything about the callee except its slot |
 | A signature changed (or a function was removed)  | `Relink`       | the graph *forces* every caller into the radius; the whole set recompiles and commits under a quiescence barrier — mismatched caller/callee ABIs are unobservable |
@@ -69,6 +70,15 @@ The live runtime then derives the *swap protocol* from the graph:
 `StateMigration` is reserved: Blaze functions are pure over `i64`s and all
 persistent state lives in the host — which is precisely *why* state survives
 every reload.
+
+`Rejected` is not a fallback bolted on top — it runs from the *same* query
+graph as everything else. A dedicated checker (`blaze_ir::diag`) re-walks each
+function with the exact statement order and declare-before-use scoping the
+lowerer itself uses, and reports every point where the lowerer would otherwise
+silently substitute a default (an unresolved name, an unknown callee, a
+mismatched argument count). Deleting a function another one still calls is not
+a special case: it is simply "now an undefined callee," caught by the same
+check, held open by the same protocol.
 
 ## How is this safe? Claims → tests
 
@@ -81,15 +91,19 @@ guarantee with a test hammering it from a second thread:
 | The blast radius of a body edit is exactly the edited function | same test: `ReloadReport::changed == ["add"]`, and the salsa execution trace shows the caller was a memo hit |
 | An ABI edit is classified `Relink` and transitions atomically | `live.rs::signature_edit_relinks_atomically_under_fire` — under the same hammering, observed values are only ever fully-old or fully-new |
 | A comment edit is proven `NoEffect`: zero codegen, zero generations | `live.rs::comment_edit_is_proven_no_effect` |
-| Deleting a function a caller still uses cannot crash the process | `live.rs::removing_a_function_is_a_relink_and_stays_safe` — the slot falls back to a missing-stub |
+| A syntax error is `Rejected`; last-good keeps answering every concurrent call | `live.rs::syntax_error_holds_last_good_under_concurrent_execution` — hammered the same way as the swap tests; every observed value is old-correct |
+| A call to an undefined function never reaches a live process | `live.rs::undefined_callee_is_rejected_not_silently_tolerated` |
+| A call-site arity mismatch is `Rejected`, not silently tolerated | `live.rs::arity_mismatch_is_rejected` |
+| Deleting a function a caller still uses is `Rejected`, not silently zeroed | `live.rs::removing_a_used_function_is_rejected_and_holds_last_good` — both functions keep working exactly as before |
+| A defective *first* program fails construction, not silent misbehavior | `live.rs::initial_load_with_a_defect_fails_construction` |
 | A live-edited `x / 0` cannot fault the host | `jit.rs::division_is_guarded_and_cannot_fault_the_process` — division is guarded in codegen; `x/0 == 0`, `INT_MIN / -1 == INT_MIN` |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 32 tests
-cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 classes
+cargo test --workspace                                  # 44 tests
+cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
 cargo run -p blaze-jit --release --example bench_reload  # latency numbers on your machine
 ```
 
@@ -148,9 +162,12 @@ or table-indirect).
 `int` (i64) functions, parameters, locals, assignment, `+ - * /`, comparisons,
 `if / else if / else`, `while`, recursion, calls, unary minus. Division is
 guarded by definition of the language — a saved typo cannot fault your process.
-Undefined callees resolve to a stub returning 0. Growing the surface (floats,
-more types, richer state) is roadmap, not architecture: the reload guarantees
-don't change as the language grows.
+Every call site is validated against a known callee (Blaze-defined or
+host-registered) with a matching argument count *before* a reload is ever
+committed — see `Rejected` above; the slot table's missing-function stub is
+kept only as defense-in-depth, unreachable through the public API in practice.
+Growing the surface (floats, more types, richer state) is roadmap, not
+architecture: the reload guarantees don't change as the language grows.
 
 ## Benchmarks
 
@@ -177,9 +194,21 @@ state.
 
 - ✅ Incremental firewall (proved by tests since the first commit)
 - ✅ Cranelift JIT backend, machine code memoized in the query graph
-- ✅ Live-swap runtime: `SafeSwap` / `Relink` / `NoEffect` classification,
-  lock-free body swaps, quiesced ABI relinks, host functions, file watching
+- ✅ Live-swap runtime: `Rejected` / `SafeSwap` / `Relink` / `NoEffect`
+  classification, lock-free body swaps, quiesced ABI relinks, host functions,
+  file watching
+- ✅ **Diagnostics gate**: syntax errors, undefined callees, arity mismatches,
+  and undefined variables are proven from the query graph and refused *before*
+  touching a live process — a bad save holds the last-good generation open
+  rather than hot-swapping mangled semantics in
 - ✅ Terminal live demo + scripted CI-safe mode + latency benchmark
+- 🔜 Stack-depth and fuel (CPU-time) limits, so unbounded recursion and
+  runaway loops fail a *call* with a defined error instead of risking the host
+- 🔜 In-process canary: mirror live traffic through a candidate generation
+  before promoting it, with an auto-abort policy
+- 🔜 Generation journal + `rollback()`: every reload's source, class, and
+  blast radius persisted; reverting is just another classified, provably-safe
+  swap
 - 🔜 `f64` and richer types (pure language growth; reload semantics unchanged)
 - 🔜 `StateMigration`: script-owned persistent state with layout versioning
 - 🔜 Windowed demo (the terminal demo is engine-complete; a `winit`/`macroquad`

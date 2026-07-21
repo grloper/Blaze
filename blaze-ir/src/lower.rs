@@ -305,7 +305,11 @@ impl<'db> Lowerer<'db> {
                 match env.get(&name) {
                     Some(&reg) => reg,
                     // An unresolved name lowers to a defined-zero value rather
-                    // than aborting; a richer frontend would raise a diagnostic.
+                    // than aborting, keeping this query total over arbitrary
+                    // input. `crate::diag::function_diagnostics` re-walks this
+                    // same traversal and reports every case that would land
+                    // here — that gate, not this fallback, is what a live
+                    // reload actually relies on to reject bad input.
                     None => b.load_int(0),
                 }
             }
@@ -346,9 +350,11 @@ impl<'db> Lowerer<'db> {
         // unchanged, so a caller is insulated from edits to a callee's internals.
         let callee_key = FnKey::new(self.db, callee_name);
         let callee_sig = function_signature(self.db, self.src, callee_key);
-        // Reading the callee's signature — never its body — is what records the
-        // firewall dependency edge. The arity is informational for now; a
-        // mismatch is tolerated because the C-subset has no diagnostics layer.
+        // Reading the callee's signature — never its body — is what records
+        // the firewall dependency edge. An arity mismatch here is tolerated by
+        // the lowerer itself (it stays total over arbitrary input); it is
+        // `crate::diag::function_diagnostics` that catches and reports it, and
+        // that is the query a live reload actually gates on.
         let _callee_arity = callee_sig.arity();
 
         let args: Vec<u32> = call
