@@ -312,8 +312,19 @@ pub struct LiveRuntime {
     /// committing a relink or a multi-function swap. This is the quiescence
     /// barrier that makes ABI transitions atomic from every caller's view.
     dispatch: RwLock<HashMap<String, DispatchEntry>>,
+    /// Per-call fuel budget (H3), read on the hot path without locking. Every
+    /// call/back-edge spends one unit; exhaustion aborts the call with
+    /// [`CallError::FuelExhausted`]. `u64::MAX` disables metering.
+    fuel_budget: AtomicU64,
     inner: Mutex<LiveInner>,
 }
+
+/// Default per-call fuel budget: generous enough that real live-logic (which
+/// scores a request in thousands of ops) never trips it, small enough that a
+/// true runaway loop aborts in a fraction of a second. Tune per workload with
+/// [`LiveRuntime::set_fuel_budget`] — a request handler wants a much tighter
+/// budget than this safety net.
+pub const DEFAULT_FUEL_BUDGET: u64 = 500_000_000;
 
 impl LiveRuntime {
     /// Compile `source` and stand the program up, ready to call.
@@ -328,6 +339,7 @@ impl LiveRuntime {
         let runtime = LiveRuntime {
             table: SwapTable::new()?,
             dispatch: RwLock::new(HashMap::new()),
+            fuel_budget: AtomicU64::new(DEFAULT_FUEL_BUDGET),
             inner: Mutex::new(LiveInner {
                 db,
                 src,
@@ -432,9 +444,9 @@ impl LiveRuntime {
         let code = self.table.slot(entry.slot).load(Ordering::Acquire) as usize as *const u8;
 
         // Fresh per-call state on this thread's stack — automatically per-thread
-        // and per-call, so concurrent callers never share counters. Fuel is
-        // disabled here (H2); the depth guard is always active.
-        let mut state = CallState::new(u64::MAX);
+        // and per-call, so concurrent callers never share counters. Depth and
+        // fuel guards are both active; the fuel budget is read lock-free.
+        let mut state = CallState::new(self.fuel_budget.load(Ordering::Relaxed));
 
         // SAFETY: `code` is either the missing stub or a finalized function
         // compiled with the context-threading `(*mut CallState, i64 × arity)`
@@ -461,6 +473,15 @@ impl LiveRuntime {
     /// every thread that will call into the runtime.
     pub fn set_max_depth(&self, limit: u64) {
         self.inner.lock().unwrap().max_depth = limit;
+    }
+
+    /// Set the per-call fuel budget (H3). Takes effect on the *next* call — no
+    /// recompilation needed, since the budget is a property of each call's
+    /// state, not the compiled code. Every call and loop back-edge spends one
+    /// unit; a call that runs out aborts with [`CallError::FuelExhausted`].
+    /// Pass [`u64::MAX`] to disable metering entirely.
+    pub fn set_fuel_budget(&self, budget: u64) {
+        self.fuel_budget.store(budget, Ordering::Relaxed);
     }
 
     /// Enable query-execution tracing on the underlying database (testing:

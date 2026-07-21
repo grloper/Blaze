@@ -98,13 +98,17 @@ guarantee with a test hammering it from a second thread:
 | A defective *first* program fails construction, not silent misbehavior | `live.rs::initial_load_with_a_defect_fails_construction` |
 | Unbounded recursion aborts the *call*, never faults the host | `live.rs::unbounded_recursion_aborts_with_error_not_a_crash` — `spin` recurses forever; every call returns `Err(ResourceExhausted)` and interleaved healthy calls stay exact, under a concurrent bystander |
 | The depth guard doesn't false-positive on real recursion | `live.rs::deep_but_bounded_recursion_succeeds` (100-deep succeeds, past-limit aborts) + `mutual_recursion_is_also_bounded` + `depth_limit_is_configurable` |
+| An infinite loop aborts with `FuelExhausted`, never hangs | `live.rs::infinite_loop_aborts_with_fuel_exhausted` — `while(1){}` returns a defined error; the runtime is healthy afterward |
+| A runaway can't permanently wedge the runtime | `live.rs::relink_commits_after_a_runaway_loop_traps` — a thread spins in a loop holding the dispatch lock; a concurrent `Relink` still commits once fuel runs out (before fuel, it would hang forever) |
+| Fuel bounds shallow-but-explosive recursion the depth guard can't | `live.rs::exponential_recursion_is_bounded_by_fuel` — naive `fib(40)` (depth 40, ~3×10⁸ calls) is caught by fuel, not depth |
+| Fuel doesn't false-positive real loops | `live.rs::legitimate_loops_run_under_fuel` — a 1000-iteration loop computes correctly under the default budget |
 | A live-edited `x / 0` cannot fault the host | `jit.rs::division_is_guarded_and_cannot_fault_the_process` — division is guarded in codegen; `x/0 == 0`, `INT_MIN / -1 == INT_MIN` |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 49 tests
+cargo test --workspace                                  # 53 tests
 cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
 cargo run -p blaze-jit --release --example bench_reload  # latency numbers on your machine
 ```
@@ -163,13 +167,15 @@ or table-indirect).
 **The language.** A deliberately small C-subset, JIT-compiled to native code:
 `int` (i64) functions, parameters, locals, assignment, `+ - * /`, comparisons,
 `if / else if / else`, `while`, recursion, calls, unary minus. Nothing a script
-can express — not a saved typo, not a divide-by-zero, not runaway recursion —
-can fault the process embedding it: division is guarded (`x/0 == 0`), every
-call site is validated against a known callee with matching arity before a
-reload commits (see `Rejected`), and every function threads a per-call context
-whose depth counter aborts runaway recursion as a typed error rather than a
-stack overflow. Growing the surface (floats, more types, richer state) is
-roadmap, not architecture: the reload and safety guarantees don't change as the
+can express — not a saved typo, not a divide-by-zero, not runaway recursion, not
+an infinite loop — can fault *or hang* the process embedding it: division is
+guarded (`x/0 == 0`), every call site is validated against a known callee with
+matching arity before a reload commits (see `Rejected`), and every function
+threads a per-call context whose depth counter aborts runaway recursion and
+whose fuel budget aborts runaway loops and explosive recursion — all as typed
+errors, never a stack overflow or a hang. Growing the surface (floats, more
+types, richer state) is roadmap, not architecture: the reload and safety
+guarantees don't change as the
 language grows.
 
 ## Benchmarks
@@ -204,13 +210,15 @@ state.
   and undefined variables are proven from the query graph and refused *before*
   touching a live process — a bad save holds the last-good generation open
   rather than hot-swapping mangled semantics in
-- ✅ **Depth guard**: every function threads a per-call context (wasmtime's
-  `vmctx` pattern) carrying a call-depth counter; a prologue that would exceed
-  the limit aborts the *call* with `Err(ResourceExhausted)` instead of blowing
-  the native stack. Runaway recursion can no longer fault the host
+- ✅ **Depth + fuel guards**: every function threads a per-call context
+  (wasmtime's `vmctx` pattern). A call-depth counter aborts runaway recursion
+  with `Err(ResourceExhausted)` before it can blow the native stack, and a
+  fuel budget — one unit per call and per loop back-edge — aborts runaway
+  loops and shallow-but-explosive recursion with `Err(FuelExhausted)`. A
+  single bad edit can no longer fault *or wedge* the runtime: a runaway that
+  would otherwise hold the dispatch lock forever now ends on its own, so a
+  reload always commits
 - ✅ Terminal live demo + scripted CI-safe mode + latency benchmark
-- 🔜 Fuel (CPU-time) metering on the same context, so runaway loops
-  (`while(1){}`) fail a *call* with a defined error too (H3)
 - 🔜 In-process canary: mirror live traffic through a candidate generation
   before promoting it, with an auto-abort policy
 - 🔜 Generation journal + `rollback()`: every reload's source, class, and
