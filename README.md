@@ -18,7 +18,7 @@
 </p>
 
 <p align="center">
-  <strong>✨ <a href="https://grloper.github.io/Blaze/">View the interactive website</a></strong>
+  <strong><a href="https://grloper.github.io/Blaze/">View the interactive website</a></strong>
 </p>
 
 <p align="center">
