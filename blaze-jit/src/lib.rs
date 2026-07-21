@@ -21,7 +21,7 @@ pub mod query;
 pub use codegen::{compile_isolated, host_isa};
 pub use engine::JitEngine;
 pub use live::{
-    CallError, EditClass, FnMetricsSnapshot, FuncHandle, JournalEntry, LiveRuntime, ReloadReport,
-    ScriptHost, Value,
+    CallError, CanaryPolicy, CanaryStatus, CanaryVerdict, EditClass, FnMetricsSnapshot, FuncHandle,
+    JournalEntry, LiveRuntime, ReloadReport, ScriptHost, Value,
 };
 pub use query::{compiled_machine_code, jit_program, CompiledFunction};
