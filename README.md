@@ -67,9 +67,9 @@ The live runtime then derives the *swap protocol* from the graph:
 | Changed functions all kept their signatures      | `SafeSwap`     | one lock-free atomic pointer store — valid under concurrent execution, because the firewall guarantees no caller's code mentions anything about the callee except its slot |
 | A signature changed (or a function was removed)  | `Relink`       | the graph *forces* every caller into the radius; the whole set recompiles and commits under a quiescence barrier — mismatched caller/callee ABIs are unobservable |
 
-`StateMigration` is reserved: Blaze functions are pure over `i64`s and all
-persistent state lives in the host — which is precisely *why* state survives
-every reload.
+`StateMigration` is reserved: Blaze functions are pure over their scalar
+arguments (`i64`/`f64`) and all persistent state lives in the host — which is
+precisely *why* state survives every reload.
 
 `Rejected` is not a fallback bolted on top — it runs from the *same* query
 graph as everything else. A dedicated checker (`blaze_ir::diag`) re-walks each
@@ -105,12 +105,17 @@ guarantee with a test hammering it from a second thread:
 | A live-edited `x / 0` cannot fault the host | `jit.rs::division_is_guarded_and_cannot_fault_the_process` — division is guarded in codegen; `x/0 == 0`, `INT_MIN / -1 == INT_MIN` |
 | The fast `FuncHandle` path is torn-free under concurrent hot-swaps | `live.rs::handle_calls_are_correct_under_concurrent_body_swap` — a thread hammers a function through a lock-free handle while it is body-swapped; every value is old- or new-correct |
 | A handle survives a body swap yet detects an arity change | `live.rs::handle_survives_body_swap_transparently` + `handle_detects_arity_change` — a stale handle never dispatches a call with a mismatched argument count |
+| `float` (f64) runs parse→lower→codegen→execute, exactly, and never faults | `floats.rs::float_arithmetic_executes_end_to_end` + `float_division_never_faults` — `x/0.0` is a defined ±inf/NaN, no guard needed |
+| A float round-trips across call/return boundaries (the `i64↔f64` bit-cast ABI) | `floats.rs::float_args_and_returns_round_trip_across_calls` + `raw_and_typed_paths_agree_on_float_bits` |
+| A float body edit hot-swaps live under a second thread, torn-free | `floats.rs::float_body_swap_is_sound_under_concurrent_execution` |
+| Retyping a parameter `int`↔`float` is a `Relink`, atomic under a second thread | `floats.rs::retyping_a_parameter_relinks_atomically_under_fire` — every observation is fully-old float or fully-new int, decoded by the matching return type |
+| A type mismatch is proven and `Rejected`, never a silent bit-reinterpretation | `blaze-ir` `diag::tests::mixed_arithmetic_is_rejected` (+ wrong-typed return, assignment, argument, and bare-float condition) |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 57 tests
+cargo test --workspace                                  # 79 tests
 cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
 cargo run -p blaze-jit --release --example bench_reload  # reload latency per edit class
 cargo run -p blaze-jit --release --example bench_calls   # call throughput (named vs handle)
@@ -129,6 +134,11 @@ assert_eq!(rt.call("add", &[2, 3]), Ok(5));
 // The handle survives body hot-swaps transparently and detects ABI changes.
 let mut add = rt.handle("add")?;
 assert_eq!(rt.call_handle(&mut add, &[2, 3]), Ok(5));
+
+// Floats are first-class through a typed value API — pass an f64, get one back:
+use blaze_jit::Value;
+let fx = LiveRuntime::new("float score(float x) { return x * 2.5; }")?;
+assert_eq!(fx.call_typed("score", &[Value::Float(2.0)]), Ok(Value::Float(5.0)));
 
 // Native functions, callable from Blaze through the same swap table:
 extern "C" fn now_ms() -> i64 { /* ... */ 0 }
@@ -173,18 +183,24 @@ emits through one shared pass with pluggable call emission (direct, relocatable,
 or table-indirect).
 
 **The language.** A deliberately small C-subset, JIT-compiled to native code:
-`int` (i64) functions, parameters, locals, assignment, `+ - * /`, comparisons,
-`if / else if / else`, `while`, recursion, calls, unary minus. Nothing a script
-can express — not a saved typo, not a divide-by-zero, not runaway recursion, not
-an infinite loop — can fault *or hang* the process embedding it: division is
-guarded (`x/0 == 0`), every call site is validated against a known callee with
-matching arity before a reload commits (see `Rejected`), and every function
-threads a per-call context whose depth counter aborts runaway recursion and
-whose fuel budget aborts runaway loops and explosive recursion — all as typed
-errors, never a stack overflow or a hang. Growing the surface (floats, more
-types, richer state) is roadmap, not architecture: the reload and safety
-guarantees don't change as the
-language grows.
+`int` (i64) and `float` (IEEE-754 f64) functions, parameters, locals,
+assignment, `+ - * /`, comparisons, `if / else if / else`, `while`, recursion,
+calls, unary minus. The two scalar types are distinct and do **not** implicitly
+convert: a mixed-type expression, a wrong-typed return or assignment, or a
+bare-`float` condition is a type error the same query graph proves and
+`Rejected`s *before* any code goes live — so the machine ABI (which carries
+every value as a raw 64-bit word and bit-casts `i64↔f64` only at call/return
+boundaries) can never reinterpret one type's bits as the other's at runtime.
+Nothing a script can express — not a saved typo, not a divide-by-zero, not
+runaway recursion, not an infinite loop — can fault *or hang* the process
+embedding it: integer division is guarded (`x/0 == 0`; IEEE float division
+simply yields ±inf/NaN, which never traps), every call site is validated against
+a known callee with matching arity *and types* before a reload commits (see
+`Rejected`), and every function threads a per-call context whose depth counter
+aborts runaway recursion and whose fuel budget aborts runaway loops and
+explosive recursion — all as typed errors, never a stack overflow or a hang.
+Growing the surface (more types, richer state) is roadmap, not architecture: the
+reload and safety guarantees don't change as the language grows.
 
 ## Benchmarks
 
@@ -244,13 +260,22 @@ because nothing on it is shared.
   lock-free at ~95 M calls/s/thread (scaling linearly across threads). Handles
   survive body hot-swaps transparently and detect ABI changes without ever
   dispatching a mismatched call
+- ✅ **`float` (f64) + a sound type system**: `int` and `float` are distinct
+  machine representations carried through one raw-64-bit ABI, bit-cast only at
+  call/return boundaries. A type checker in the same query graph refuses every
+  mismatch — mixed arithmetic, a wrong-typed return/assignment/argument, a
+  bare-`float` condition — *before* a reload commits, so the coercion path is
+  provably never observed at runtime. Retyping a parameter is an ABI change the
+  firewall classifies as a `Relink`, atomic even under concurrent calls. Floats
+  reach the host through a typed `Value` API (`call_typed` / `call_handle_typed`)
 - ✅ Terminal live demo + scripted CI-safe mode + reload & call benchmarks
 - 🔜 In-process canary: mirror live traffic through a candidate generation
   before promoting it, with an auto-abort policy
 - 🔜 Generation journal + `rollback()`: every reload's source, class, and
   blast radius persisted; reverting is just another classified, provably-safe
   swap
-- 🔜 `f64` and richer types (pure language growth; reload semantics unchanged)
+- 🔜 Richer types and explicit `int`↔`float` conversions (pure language growth;
+  reload semantics unchanged)
 - 🔜 `StateMigration`: script-owned persistent state with layout versioning
 - 🔜 Windowed demo (the terminal demo is engine-complete; a `winit`/`macroquad`
   frontend is presentation), editor status-line plugin, GIF for this README

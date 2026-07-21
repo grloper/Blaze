@@ -56,6 +56,7 @@ macro_rules! ast_node {
 
 ast_node!(SourceFile, SyntaxKind::SOURCE_FILE);
 ast_node!(Function, SyntaxKind::FN);
+ast_node!(TypeRef, SyntaxKind::TYPE);
 ast_node!(ParamList, SyntaxKind::PARAM_LIST);
 ast_node!(Param, SyntaxKind::PARAM);
 ast_node!(Name, SyntaxKind::NAME);
@@ -87,6 +88,27 @@ impl SourceFile {
     }
 }
 
+/// A declared scalar type in the surface syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Ty {
+    Int,
+    Float,
+}
+
+impl TypeRef {
+    /// The type this reference names, if it is a recognized type keyword.
+    pub fn ty(&self) -> Option<Ty> {
+        self.0
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find_map(|t| match t.kind() {
+                SyntaxKind::INT_KW => Some(Ty::Int),
+                SyntaxKind::FLOAT_KW => Some(Ty::Float),
+                _ => None,
+            })
+    }
+}
+
 impl Name {
     /// The identifier text of this binding occurrence.
     pub fn text(&self) -> Option<String> {
@@ -102,13 +124,24 @@ impl Function {
 
     /// The parameter names, in declaration order.
     pub fn params(&self) -> Vec<String> {
+        self.param_decls().into_iter().map(|(name, _)| name).collect()
+    }
+
+    /// The parameters as `(name, type)` pairs, in declaration order. A missing
+    /// type defaults to `int` so downstream stays total on malformed input.
+    pub fn param_decls(&self) -> Vec<(String, Ty)> {
         child::<ParamList>(&self.0)
             .map(|pl| {
                 children::<Param>(pl.syntax())
-                    .filter_map(|p| p.name())
+                    .filter_map(|p| Some((p.name()?, p.ty().unwrap_or(Ty::Int))))
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The declared return type (defaults to `int` if absent/malformed).
+    pub fn return_type(&self) -> Ty {
+        child::<TypeRef>(&self.0).and_then(|t| t.ty()).unwrap_or(Ty::Int)
     }
 
     /// The function body block, if present.
@@ -126,6 +159,10 @@ impl Function {
 impl Param {
     pub fn name(&self) -> Option<String> {
         child::<Name>(&self.0).and_then(|n| n.text())
+    }
+    /// The declared parameter type.
+    pub fn ty(&self) -> Option<Ty> {
+        child::<TypeRef>(&self.0).and_then(|t| t.ty())
     }
 }
 
@@ -165,6 +202,10 @@ impl LetStmt {
     /// The bound variable name.
     pub fn name(&self) -> Option<String> {
         child::<Name>(&self.0).and_then(|n| n.text())
+    }
+    /// The declared type of the binding.
+    pub fn ty(&self) -> Option<Ty> {
+        child::<TypeRef>(&self.0).and_then(|t| t.ty())
     }
     /// The initializer expression.
     pub fn value(&self) -> Option<Expr> {
@@ -309,10 +350,25 @@ impl BinOp {
     }
 }
 
+/// A literal's parsed value, carrying its type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Lit {
+    Int(i64),
+    Float(f64),
+}
+
 impl LiteralExpr {
-    /// The integer value, parsed from the literal's text.
-    pub fn value(&self) -> Option<i64> {
-        token_text(&self.0, SyntaxKind::INT_LITERAL).and_then(|t| t.parse().ok())
+    /// The literal's parsed value and type (`3` is [`Lit::Int`], `3.0` is
+    /// [`Lit::Float`]).
+    pub fn literal(&self) -> Option<Lit> {
+        self.0
+            .children_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find_map(|t| match t.kind() {
+                SyntaxKind::INT_LITERAL => t.text().parse().ok().map(Lit::Int),
+                SyntaxKind::FLOAT_LITERAL => t.text().parse().ok().map(Lit::Float),
+                _ => None,
+            })
     }
 }
 
@@ -409,6 +465,24 @@ mod tests {
         assert_eq!(assign.name().as_deref(), Some("n"));
         let Some(Expr::Bin(rhs)) = assign.value() else { panic!() };
         assert_eq!(rhs.op(), Some(BinOp::Sub));
+    }
+
+    #[test]
+    fn reads_float_types_and_literals() {
+        let file = SourceFile::parse(
+            "float scale(float x, int n) {\n  float y = x * 2.5;\n  return y;\n}",
+        );
+        let f = file.functions().next().unwrap();
+        assert_eq!(f.return_type(), Ty::Float);
+        assert_eq!(f.param_decls(), vec![("x".into(), Ty::Float), ("n".into(), Ty::Int)]);
+
+        let stmts: Vec<_> = f.body().unwrap().statements().collect();
+        let Stmt::Let(let_stmt) = &stmts[0] else { panic!("expected let") };
+        assert_eq!(let_stmt.ty(), Some(Ty::Float));
+        let Some(Expr::Bin(bin)) = let_stmt.value() else { panic!("expected bin") };
+        let (_, rhs) = bin.operands();
+        let Some(Expr::Literal(lit)) = rhs else { panic!("expected literal rhs") };
+        assert_eq!(lit.literal(), Some(Lit::Float(2.5)));
     }
 
     #[test]

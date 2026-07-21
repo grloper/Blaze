@@ -21,14 +21,16 @@ pub enum SyntaxKind {
 
     // ---- Keywords ----
     INT_KW,    // `int`
+    FLOAT_KW,  // `float`
     RETURN_KW, // `return`
     IF_KW,     // `if`
     ELSE_KW,   // `else`
     WHILE_KW,  // `while`
 
     // ---- Literals & identifiers ----
-    INT_LITERAL, // `42`
-    IDENT,       // `main`, `x`
+    INT_LITERAL,   // `42`
+    FLOAT_LITERAL, // `3.14`
+    IDENT,         // `main`, `x`
 
     // ---- Punctuation ----
     L_PAREN,   // `(`
@@ -57,6 +59,7 @@ pub enum SyntaxKind {
     // ---- Composite nodes (parser output) ----
     SOURCE_FILE,  // the whole translation unit
     FN,           // `int name(params) { .. }`
+    TYPE,         // `int` or `float` in a type position
     PARAM_LIST,   // `( int a, int b )`
     PARAM,        // `int a`
     BLOCK,        // `{ .. }`

@@ -20,5 +20,5 @@ pub mod query;
 
 pub use codegen::{compile_isolated, host_isa};
 pub use engine::JitEngine;
-pub use live::{CallError, EditClass, FuncHandle, LiveRuntime, ReloadReport, ScriptHost};
+pub use live::{CallError, EditClass, FuncHandle, LiveRuntime, ReloadReport, ScriptHost, Value};
 pub use query::{compiled_machine_code, jit_program, CompiledFunction};

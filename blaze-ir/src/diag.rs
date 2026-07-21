@@ -21,13 +21,16 @@
 //! non-empty result as a hard gate — the edit is rejected and the previous,
 //! known-good generation keeps serving traffic untouched.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use blaze_parse::ast::{AstNode, Block, ElseArm, Expr, Function, IfStmt, Stmt};
+use blaze_parse::ast::{
+    AstNode, BinExpr, BinOp, Block, CallExpr, ElseArm, Expr, Function, IfStmt, Stmt,
+};
 use blaze_parse::SyntaxNode;
 
 use crate::db::{BlazeDatabase, FnKey, HostFunctions, SourceProgram};
+use crate::ir::{Signature, Type};
 use crate::lower::{function_signature, function_text, program_outline};
 
 /// A single statically-detectable defect in one function's source.
@@ -71,8 +74,13 @@ pub fn function_diagnostics<'db>(
         return Arc::new(diags);
     };
 
-    let known = known_callables(db, src, host);
-    let mut checker = Checker { known: &known, diags: Vec::new() };
+    let sigs = signatures(db, src, host);
+    let mut checker = Checker {
+        sigs: &sigs,
+        vars: HashMap::new(),
+        ret: Type::Int,
+        diags: Vec::new(),
+    };
     checker.check_function(&func);
     diags.extend(checker.diags);
 
@@ -111,160 +119,311 @@ pub fn format_diagnostics(diags: &[(String, Diagnostic)]) -> String {
     out
 }
 
-/// name → declared arity, over the union of Blaze-defined functions and
+/// name → full ABI signature, over the union of Blaze-defined functions and
 /// host-registered native functions — the one namespace call sites resolve
-/// against.
-fn known_callables(
+/// against. Host functions are `(int × arity) -> int` (the C ABI the embedder
+/// registers them with).
+fn signatures(
     db: &dyn BlazeDatabase,
     src: SourceProgram,
     host: HostFunctions,
-) -> HashMap<String, usize> {
-    let mut known = HashMap::new();
+) -> HashMap<String, Signature> {
+    let mut sigs = HashMap::new();
     for name in program_outline(db, src).iter() {
         let key = FnKey::new(db, name.clone());
-        known.insert(name.clone(), function_signature(db, src, key).arity());
+        sigs.insert(name.clone(), function_signature(db, src, key));
     }
     for (name, arity) in host.arities(db) {
-        known.entry(name.clone()).or_insert(*arity);
+        sigs.entry(name.clone())
+            .or_insert_with(|| Signature { params: vec![Type::Int; *arity], ret: Type::Int });
     }
-    known
+    sigs
+}
+
+/// Map a surface [`blaze_parse::Ty`] to a DevIR [`Type`] (kept local so this
+/// gate does not couple to `lower`'s internals).
+fn ty_of(ty: blaze_parse::Ty) -> Type {
+    match ty {
+        blaze_parse::Ty::Int => Type::Int,
+        blaze_parse::Ty::Float => Type::Float,
+    }
+}
+
+/// The surface spelling of a type, for diagnostics.
+fn type_name(t: Type) -> &'static str {
+    match t {
+        Type::Int => "int",
+        Type::Float => "float",
+    }
+}
+
+/// The surface spelling of a binary operator, for diagnostics.
+fn op_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Lt => "<",
+        BinOp::Gt => ">",
+        BinOp::LtEq => "<=",
+        BinOp::GtEq => ">=",
+        BinOp::EqEq => "==",
+        BinOp::NotEq => "!=",
+    }
 }
 
 /// Walks a function's AST with exactly the statement/expression order
-/// `lower::Lowerer` uses, tracking which names are declared-so-far instead of
-/// building IR. Where the lowerer would fall back to a default, this reports a
-/// diagnostic instead.
+/// `lower::Lowerer` uses, tracking each name's *type* (not merely whether it is
+/// declared). Where the lowerer would fall back to a default — or silently
+/// bit-reinterpret one type as another via [`crate::lower`]'s `coerce` — this
+/// reports a diagnostic instead.
+///
+/// This is what makes the language's implicit-coercion path unreachable in a
+/// live program: `int` and `float` are distinct machine representations, so a
+/// mismatch at an assignment, return, argument, condition, or arithmetic
+/// boundary would compile to a bit reinterpretation that reads garbage. The
+/// live runtime gates on this being empty, so such a program is rejected before
+/// any generation is committed — never observed at runtime.
 struct Checker<'a> {
-    known: &'a HashMap<String, usize>,
+    sigs: &'a HashMap<String, Signature>,
+    /// name → type of every variable declared so far, in the same flat,
+    /// order-of-traversal scope the lowerer uses.
+    vars: HashMap<String, Type>,
+    /// The declared return type of the function currently being checked.
+    ret: Type,
     diags: Vec<Diagnostic>,
 }
 
 impl Checker<'_> {
     fn check_function(&mut self, func: &Function) {
-        let mut declared: HashSet<String> = func.params().into_iter().collect();
+        for (name, ty) in func.param_decls() {
+            self.vars.insert(name, ty_of(ty));
+        }
+        self.ret = ty_of(func.return_type());
         if let Some(block) = func.body() {
-            self.check_block(&block, &mut declared);
+            self.check_block(&block);
         }
     }
 
-    fn check_block(&mut self, block: &Block, declared: &mut HashSet<String>) {
+    fn check_block(&mut self, block: &Block) {
         for stmt in block.statements() {
-            self.check_stmt(&stmt, declared);
+            self.check_stmt(&stmt);
         }
     }
 
-    fn check_stmt(&mut self, stmt: &Stmt, declared: &mut HashSet<String>) {
+    fn check_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Let(s) => {
-                if let Some(v) = s.value() {
-                    self.check_expr(&v, declared);
-                }
-                if let Some(n) = s.name() {
-                    declared.insert(n);
+                let value_ty = s.value().and_then(|v| self.type_of(&v));
+                let declared = s.ty().map(ty_of);
+                if let Some(name) = s.name() {
+                    if let (Some(d), Some(v)) = (declared, value_ty) {
+                        if d != v {
+                            self.report(
+                                format!(
+                                    "type mismatch: `{name}` is declared {} but its initializer is {}",
+                                    type_name(d),
+                                    type_name(v)
+                                ),
+                                s.syntax(),
+                            );
+                        }
+                    }
+                    // The declared type is the variable's contract for the rest
+                    // of the function; fall back to the initializer's type only
+                    // when no type was written (malformed input).
+                    self.vars.insert(name, declared.or(value_ty).unwrap_or(Type::Int));
                 }
             }
             Stmt::Assign(s) => {
-                if let Some(v) = s.value() {
-                    self.check_expr(&v, declared);
-                }
-                if let Some(n) = s.name() {
-                    if !declared.contains(&n) {
-                        self.report(
-                            format!("assignment to undeclared variable `{n}` (use `int {n} = ...;` to declare it)"),
-                            s.syntax(),
-                        );
+                let value_ty = s.value().and_then(|v| self.type_of(&v));
+                if let Some(name) = s.name() {
+                    match self.vars.get(&name).copied() {
+                        Some(var_ty) => {
+                            if let Some(v) = value_ty {
+                                if v != var_ty {
+                                    self.report(
+                                        format!(
+                                            "type mismatch: cannot assign {} to `{name}` of type {}",
+                                            type_name(v),
+                                            type_name(var_ty)
+                                        ),
+                                        s.syntax(),
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            self.report(
+                                format!("assignment to undeclared variable `{name}` (use `int {name} = ...;` to declare it)"),
+                                s.syntax(),
+                            );
+                            // The lowerer auto-declares on first assignment with
+                            // the value's type; mirror that so a single typo
+                            // reports once, not on every later use.
+                            self.vars.insert(name, value_ty.unwrap_or(Type::Int));
+                        }
                     }
-                    // The lowerer auto-declares on first assignment (matches
-                    // its `env.entry(..).or_insert_with(..)`); mirror that so a
-                    // single typo reports once, not on every later use.
-                    declared.insert(n);
                 }
             }
             Stmt::Return(s) => {
                 if let Some(v) = s.value() {
-                    self.check_expr(&v, declared);
-                }
-            }
-            Stmt::If(s) => self.check_if(s, declared),
-            Stmt::While(s) => {
-                if let Some(c) = s.condition() {
-                    self.check_expr(&c, declared);
-                }
-                if let Some(b) = s.body() {
-                    self.check_block(&b, declared);
-                }
-            }
-            Stmt::Expr(s) => {
-                if let Some(e) = s.expr() {
-                    self.check_expr(&e, declared);
-                }
-            }
-        }
-    }
-
-    fn check_if(&mut self, s: &IfStmt, declared: &mut HashSet<String>) {
-        if let Some(c) = s.condition() {
-            self.check_expr(&c, declared);
-        }
-        if let Some(then) = s.then_block() {
-            self.check_block(&then, declared);
-        }
-        match s.else_arm() {
-            Some(ElseArm::Block(b)) => self.check_block(&b, declared),
-            Some(ElseArm::If(nested)) => self.check_if(&nested, declared),
-            None => {}
-        }
-    }
-
-    fn check_expr(&mut self, expr: &Expr, declared: &HashSet<String>) {
-        match expr {
-            Expr::Literal(_) => {}
-            Expr::NameRef(n) => {
-                if let Some(name) = n.text() {
-                    if !declared.contains(&name) {
-                        self.report(format!("use of undefined variable `{name}`"), n.syntax());
-                    }
-                }
-            }
-            Expr::Bin(b) => {
-                let (l, r) = b.operands();
-                if let Some(l) = l {
-                    self.check_expr(&l, declared);
-                }
-                if let Some(r) = r {
-                    self.check_expr(&r, declared);
-                }
-            }
-            Expr::Prefix(p) => {
-                if let Some(o) = p.operand() {
-                    self.check_expr(&o, declared);
-                }
-            }
-            Expr::Paren(p) => {
-                if let Some(i) = p.inner() {
-                    self.check_expr(&i, declared);
-                }
-            }
-            Expr::Call(c) => {
-                for a in c.args() {
-                    self.check_expr(&a, declared);
-                }
-                let callee = c.callee().unwrap_or_default();
-                match self.known.get(callee.as_str()) {
-                    None => self.report(
-                        format!("call to undefined function `{callee}`"),
-                        c.syntax(),
-                    ),
-                    Some(&expected) => {
-                        let got = c.args().len();
-                        if expected != got {
+                    if let Some(vt) = self.type_of(&v) {
+                        if vt != self.ret {
                             self.report(
-                                format!("`{callee}` expects {expected} argument(s), found {got}"),
-                                c.syntax(),
+                                format!(
+                                    "type mismatch: returns {} but the function's return type is {}",
+                                    type_name(vt),
+                                    type_name(self.ret)
+                                ),
+                                s.syntax(),
                             );
                         }
                     }
                 }
+            }
+            Stmt::If(s) => self.check_if(s),
+            Stmt::While(s) => {
+                self.check_condition(s.condition());
+                if let Some(b) = s.body() {
+                    self.check_block(&b);
+                }
+            }
+            Stmt::Expr(s) => {
+                if let Some(e) = s.expr() {
+                    self.type_of(&e);
+                }
+            }
+        }
+    }
+
+    fn check_if(&mut self, s: &IfStmt) {
+        self.check_condition(s.condition());
+        if let Some(then) = s.then_block() {
+            self.check_block(&then);
+        }
+        match s.else_arm() {
+            Some(ElseArm::Block(b)) => self.check_block(&b),
+            Some(ElseArm::If(nested)) => self.check_if(&nested),
+            None => {}
+        }
+    }
+
+    /// A condition is tested `!= 0`, so it must be an `int` (comparisons already
+    /// yield `int`). A bare `float` condition would compile to a bit-reinterpret
+    /// of its pattern — rejected here.
+    fn check_condition(&mut self, cond: Option<Expr>) {
+        if let Some(c) = cond {
+            if let Some(t) = self.type_of(&c) {
+                if t != Type::Int {
+                    self.report(
+                        format!("type mismatch: condition must be int, found {}", type_name(t)),
+                        c.syntax(),
+                    );
+                }
+            }
+        }
+    }
+
+    /// Compute an expression's type, reporting any defect it contains
+    /// (undefined name/callee, arity mismatch, or a type mismatch at an
+    /// operator or call boundary). Returns `None` when a subexpression is
+    /// unresolvable, which suppresses cascading type errors above it.
+    fn type_of(&mut self, expr: &Expr) -> Option<Type> {
+        match expr {
+            Expr::Literal(lit) => match lit.literal() {
+                Some(blaze_parse::ast::Lit::Int(_)) => Some(Type::Int),
+                Some(blaze_parse::ast::Lit::Float(_)) => Some(Type::Float),
+                None => None,
+            },
+            Expr::NameRef(n) => {
+                let name = n.text()?;
+                match self.vars.get(&name) {
+                    Some(&t) => Some(t),
+                    None => {
+                        self.report(format!("use of undefined variable `{name}`"), n.syntax());
+                        None
+                    }
+                }
+            }
+            Expr::Bin(b) => self.type_of_bin(b),
+            Expr::Prefix(p) => p.operand().and_then(|o| self.type_of(&o)),
+            Expr::Paren(p) => p.inner().and_then(|i| self.type_of(&i)),
+            Expr::Call(c) => self.type_of_call(c),
+        }
+    }
+
+    fn type_of_bin(&mut self, b: &BinExpr) -> Option<Type> {
+        let (l, r) = b.operands();
+        let lt = l.as_ref().and_then(|e| self.type_of(e));
+        let rt = r.as_ref().and_then(|e| self.type_of(e));
+        let op = b.op().unwrap_or(BinOp::Add);
+        let is_cmp = matches!(
+            op,
+            BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq | BinOp::EqEq | BinOp::NotEq
+        );
+        // Both operands must share a type: the lowerer would otherwise coerce
+        // (bit-reinterpret) one side. Only report when both types are known, so
+        // an already-reported undefined operand doesn't cascade.
+        if let (Some(lt), Some(rt)) = (lt, rt) {
+            if lt != rt {
+                self.report(
+                    format!(
+                        "type mismatch: `{}` cannot combine {} and {}",
+                        op_symbol(op),
+                        type_name(lt),
+                        type_name(rt)
+                    ),
+                    b.syntax(),
+                );
+            }
+        }
+        // A comparison always yields `int`; arithmetic yields the operand type.
+        if is_cmp {
+            Some(Type::Int)
+        } else {
+            lt.or(rt)
+        }
+    }
+
+    fn type_of_call(&mut self, c: &CallExpr) -> Option<Type> {
+        // Resolve argument types first (reporting any nested defects).
+        let arg_exprs = c.args();
+        let arg_types: Vec<Option<Type>> =
+            arg_exprs.iter().map(|a| self.type_of(a)).collect();
+        let callee = c.callee().unwrap_or_default();
+        match self.sigs.get(callee.as_str()) {
+            None => {
+                self.report(format!("call to undefined function `{callee}`"), c.syntax());
+                None
+            }
+            Some(sig) => {
+                let expected = sig.params.len();
+                let got = arg_exprs.len();
+                if expected != got {
+                    self.report(
+                        format!("`{callee}` expects {expected} argument(s), found {got}"),
+                        c.syntax(),
+                    );
+                } else {
+                    for (i, (at, pty)) in arg_types.iter().zip(sig.params.iter()).enumerate() {
+                        if let Some(at) = at {
+                            if at != pty {
+                                self.report(
+                                    format!(
+                                        "type mismatch: argument {} to `{callee}` is {} but expects {}",
+                                        i + 1,
+                                        type_name(*at),
+                                        type_name(*pty)
+                                    ),
+                                    c.syntax(),
+                                );
+                            }
+                        }
+                    }
+                }
+                Some(sig.ret)
             }
         }
     }
@@ -348,5 +507,81 @@ mod tests {
         arities.insert("triple".to_string(), 1);
         let host = HostFunctions::new(&db, arities);
         assert!(program_diagnostics(&db, source, host).is_empty());
+    }
+
+    #[test]
+    fn well_typed_float_program_has_no_diagnostics() {
+        let msgs = messages(
+            "float scale(float x) { float y = x * 2.5; return y; }\nfloat main() { return scale(1.5); }",
+        );
+        assert!(msgs.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn mixed_arithmetic_is_rejected() {
+        // `1 + 2.5` would bit-reinterpret the integer `1` as an f64 — garbage.
+        let msgs = messages("float main() { return 1 + 2.5; }\n");
+        assert!(
+            msgs.iter().any(|m| m.contains("cannot combine int and float")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn returning_the_wrong_type_is_rejected() {
+        let msgs = messages("int main() { return 1.5; }\n");
+        assert!(
+            msgs.iter().any(|m| m.contains("returns float")
+                && m.contains("return type is int")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn assigning_the_wrong_type_is_rejected() {
+        let msgs = messages("int main() { int x = 0; x = 1.5; return x; }\n");
+        assert!(
+            msgs.iter().any(|m| m.contains("cannot assign float to `x` of type int")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn let_initializer_type_must_match_declaration() {
+        let msgs = messages("int main() { float x = 3; return 0; }\n");
+        assert!(
+            msgs.iter().any(|m| m.contains("`x` is declared float")
+                && m.contains("initializer is int")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn float_condition_is_rejected() {
+        // A bare float condition would compile to a bit-reinterpret + `!= 0`.
+        let msgs = messages("int main() { float x = 1.5; if (x) { return 1; } return 0; }\n");
+        assert!(
+            msgs.iter().any(|m| m.contains("condition must be int, found float")),
+            "{msgs:?}"
+        );
+    }
+
+    #[test]
+    fn float_comparison_is_a_valid_condition() {
+        // A comparison yields `int`, so `x > 0.0` is a well-typed condition.
+        let msgs =
+            messages("int main() { float x = 1.5; if (x > 0.0) { return 1; } return 0; }\n");
+        assert!(msgs.is_empty(), "{msgs:?}");
+    }
+
+    #[test]
+    fn passing_the_wrong_argument_type_is_rejected() {
+        let msgs = messages(
+            "int twice(int n) { return n + n; }\nfloat main() { return twice(1.5); }",
+        );
+        assert!(
+            msgs.iter().any(|m| m.contains("argument 1 to `twice` is float but expects int")),
+            "{msgs:?}"
+        );
     }
 }

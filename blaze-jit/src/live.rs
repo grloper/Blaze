@@ -27,10 +27,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use cranelift_codegen::ir::{AbiParam, InstBuilder, MemFlagsData, Signature as ClifSig, UserFuncName, Value};
+use cranelift_codegen::ir::{
+    AbiParam, InstBuilder, MemFlagsData, Signature as ClifSig, UserFuncName, Value as ClifValue,
+};
 use cranelift_codegen::isa::{CallConv, OwnedTargetIsa};
 use cranelift_codegen::ir::types;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -40,7 +42,7 @@ use cranelift_module::{default_libcall_names, Linkage, Module};
 use blaze_ir::db::{BlazeDatabaseImpl, ExecTrace, FnKey, HostFunctions, SourceProgram};
 use blaze_ir::diag::{format_diagnostics, program_diagnostics};
 use blaze_ir::lower::{lowered_dev_ir, program_outline};
-use blaze_ir::{Diagnostic, FunctionId, FunctionNode};
+use blaze_ir::{Diagnostic, FunctionId, FunctionNode, Signature, Type};
 use salsa::Setter;
 
 use crate::abi::{self, CallState, MAX_ARITY, TRAP_FUEL, TRAP_STACK};
@@ -186,10 +188,10 @@ impl CallEmitter for TableEmitter<'_> {
     fn emit_call(
         &mut self,
         builder: &mut FunctionBuilder,
-        ctx: Value,
+        ctx: ClifValue,
         callee: FunctionId,
-        args: &[Value],
-    ) -> Value {
+        args: &[ClifValue],
+    ) -> ClifValue {
         let slot_index = *self
             .slots
             .get(&callee)
@@ -264,11 +266,56 @@ pub struct ReloadReport {
     pub diagnostics: Vec<(String, Diagnostic)>,
 }
 
+/// A Blaze value crossing the host boundary: an `int` or a `float`.
+///
+/// Inside generated code every value is carried as a raw 64-bit pattern (see
+/// [`crate::codegen`]); this enum is the one place those bits are given a type,
+/// so a host can pass a `float` argument and read a real `f64` result back from
+/// a `float`-returning function — e.g. a live risk score — rather than
+/// bit-punning by hand.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Value {
+    Int(i64),
+    Float(f64),
+}
+
+impl Value {
+    /// This value's Blaze type.
+    #[inline]
+    pub fn ty(self) -> Type {
+        match self {
+            Value::Int(_) => Type::Int,
+            Value::Float(_) => Type::Float,
+        }
+    }
+
+    /// The raw 64-bit ABI word this value is carried as.
+    #[inline]
+    fn to_abi(self) -> i64 {
+        match self {
+            Value::Int(i) => i,
+            Value::Float(f) => f.to_bits() as i64,
+        }
+    }
+
+    /// Re-interpret a raw ABI word as a value of type `ty`.
+    #[inline]
+    fn from_abi(bits: i64, ty: Type) -> Value {
+        match ty {
+            Type::Int => Value::Int(bits),
+            Type::Float => Value::Float(f64::from_bits(bits as u64)),
+        }
+    }
+}
+
 /// Why a [`LiveRuntime::call`] could not run, or could not run to completion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallError {
     UnknownFunction(String),
     ArityMismatch { name: String, expected: usize, got: usize },
+    /// A typed call ([`LiveRuntime::call_typed`]) passed an argument whose type
+    /// does not match the function's declared parameter type.
+    TypeMismatch { name: String, position: usize, expected: Type, got: Type },
     UnsupportedArity(usize),
     /// The call exceeded the call-nesting limit (runaway recursion). The call
     /// was aborted and the process/runtime left consistent; nothing faulted.
@@ -288,6 +335,19 @@ impl std::fmt::Display for CallError {
             CallError::UnknownFunction(name) => write!(f, "unknown function `{name}`"),
             CallError::ArityMismatch { name, expected, got } => {
                 write!(f, "`{name}` takes {expected} argument(s), got {got}")
+            }
+            CallError::TypeMismatch { name, position, expected, got } => {
+                let ty = |t: &Type| match t {
+                    Type::Int => "int",
+                    Type::Float => "float",
+                };
+                write!(
+                    f,
+                    "`{name}` argument {} expects {}, got {}",
+                    position + 1,
+                    ty(expected),
+                    ty(got)
+                )
             }
             CallError::UnsupportedArity(n) => write!(f, "arity {n} exceeds the dispatch limit"),
             CallError::ResourceExhausted => {
@@ -317,6 +377,10 @@ pub struct FuncHandle {
     name: String,
     slot: usize,
     arity: usize,
+    /// The function's signature at resolve time, for the typed fast path
+    /// ([`LiveRuntime::call_handle_typed`]). Refreshed alongside slot/arity when
+    /// a relink changes the ABI.
+    sig: Arc<Signature>,
 }
 
 impl FuncHandle {
@@ -330,11 +394,13 @@ impl FuncHandle {
 // The runtime
 // ---------------------------------------------------------------------------
 
-/// Per-name dispatch data used by [`LiveRuntime::call`].
-#[derive(Debug, Clone, Copy)]
+/// Per-name dispatch data used by [`LiveRuntime::call`]. The signature is
+/// `Arc`-shared so cloning an entry (on the typed call path) is pointer-cheap.
+#[derive(Debug, Clone)]
 struct DispatchEntry {
     slot: usize,
     arity: usize,
+    sig: Arc<Signature>,
 }
 
 /// Mutable compilation state, serialized behind one mutex. The call path never
@@ -462,10 +528,13 @@ impl LiveRuntime {
         // are invoked through the same ABI as Blaze functions.
         let trampoline = compile_host_trampoline(&mut inner.trampolines, arity, ptr);
         self.table.publish(slot, arity, trampoline as u64);
+        // Host functions speak the C ABI the embedder registered them with:
+        // `(int × arity) -> int`. That is their signature for typed dispatch.
+        let sig = Arc::new(Signature { params: vec![Type::Int; arity], ret: Type::Int });
         self.dispatch
             .write()
             .unwrap()
-            .insert(name.to_string(), DispatchEntry { slot, arity });
+            .insert(name.to_string(), DispatchEntry { slot, arity, sig });
     }
 
     /// Swap the program's source. Classifies the edit from the query graph,
@@ -495,7 +564,6 @@ impl LiveRuntime {
         let dispatch = self.dispatch.read().unwrap();
         let entry = dispatch
             .get(name)
-            .copied()
             .ok_or_else(|| CallError::UnknownFunction(name.to_string()))?;
         if entry.arity != args.len() {
             return Err(CallError::ArityMismatch {
@@ -514,6 +582,51 @@ impl LiveRuntime {
         // was checked against the dispatch table, updated atomically under the
         // same lock held here.
         unsafe { self.run(code, args) }
+    }
+
+    /// Invoke `name` with *typed* arguments, returning a typed result.
+    ///
+    /// Where [`Self::call`] speaks the raw `i64` ABI, this validates each
+    /// argument's type against the function's declared signature and decodes the
+    /// result into [`Value::Int`] or [`Value::Float`] — the path a host uses to
+    /// call a `float`-returning function (e.g. a risk score) without bit-punning
+    /// by hand. It runs on the same sound footing as [`Self::call`]: safe under
+    /// concurrent reloads (the dispatch read lock is the quiescence barrier), and
+    /// resource/fuel traps surface as typed errors.
+    pub fn call_typed(&self, name: &str, args: &[Value]) -> Result<Value, CallError> {
+        let dispatch = self.dispatch.read().unwrap();
+        let entry = dispatch
+            .get(name)
+            .ok_or_else(|| CallError::UnknownFunction(name.to_string()))?;
+        if entry.arity != args.len() {
+            return Err(CallError::ArityMismatch {
+                name: name.to_string(),
+                expected: entry.arity,
+                got: args.len(),
+            });
+        }
+        if args.len() > MAX_ARITY {
+            return Err(CallError::UnsupportedArity(args.len()));
+        }
+        // Validate and encode each argument against its declared parameter type.
+        let mut raw = [0i64; MAX_ARITY];
+        for (i, (v, pty)) in args.iter().zip(entry.sig.params.iter()).enumerate() {
+            if v.ty() != *pty {
+                return Err(CallError::TypeMismatch {
+                    name: name.to_string(),
+                    position: i,
+                    expected: *pty,
+                    got: v.ty(),
+                });
+            }
+            raw[i] = v.to_abi();
+        }
+        let ret_ty = entry.sig.ret;
+        let code = self.table.code(entry.slot).load(Ordering::Acquire) as usize as *const u8;
+        // SAFETY: as in `call` — finalized context-threading code, arity checked
+        // under the same lock; the raw words carry each value's exact ABI bits.
+        let bits = unsafe { self.run(code, &raw[..args.len()]) }?;
+        Ok(Value::from_abi(bits, ret_ty))
     }
 
     /// Allocate this call's state, invoke `code`, and translate a resource trap
@@ -545,9 +658,13 @@ impl LiveRuntime {
         let dispatch = self.dispatch.read().unwrap();
         let entry = dispatch
             .get(name)
-            .copied()
             .ok_or_else(|| CallError::UnknownFunction(name.to_string()))?;
-        Ok(FuncHandle { name: name.to_string(), slot: entry.slot, arity: entry.arity })
+        Ok(FuncHandle {
+            name: name.to_string(),
+            slot: entry.slot,
+            arity: entry.arity,
+            sig: entry.sig.clone(),
+        })
     }
 
     /// Invoke a previously-[resolved](Self::handle) function on its lock-free
@@ -599,6 +716,41 @@ impl LiveRuntime {
             *handle = self.handle(&handle.name)?;
         }
         Err(CallError::HandleStale)
+    }
+
+    /// The typed counterpart of [`Self::call_handle`]: the lock-free fast path,
+    /// but validating argument types and decoding the result against the
+    /// handle's signature. Use this for a hot serving loop over a
+    /// `float`-returning function.
+    pub fn call_handle_typed(
+        &self,
+        handle: &mut FuncHandle,
+        args: &[Value],
+    ) -> Result<Value, CallError> {
+        if args.len() > MAX_ARITY {
+            return Err(CallError::UnsupportedArity(args.len()));
+        }
+        // Validate and encode against the handle's *current* signature. A relink
+        // that changes arity is caught by `call_handle` below (which refreshes);
+        // one that changes only types is as rare and as non-faulting as on the
+        // raw path — the encoded bits are still a valid 64-bit word either way.
+        let mut raw = [0i64; MAX_ARITY];
+        for (i, (v, pty)) in args.iter().zip(handle.sig.params.iter()).enumerate() {
+            if v.ty() != *pty {
+                return Err(CallError::TypeMismatch {
+                    name: handle.name.clone(),
+                    position: i,
+                    expected: *pty,
+                    got: v.ty(),
+                });
+            }
+            raw[i] = v.to_abi();
+        }
+        // `call_handle` enforces arity (refreshing the handle if a relink changed
+        // it), runs the code, and leaves `handle.sig` current — so decode the
+        // result against the possibly-refreshed return type.
+        let bits = self.call_handle(handle, &raw[..args.len()])?;
+        Ok(Value::from_abi(bits, handle.sig.ret))
     }
 
     /// Number of completed generations (0 after `new`, +1 per effective reload).
@@ -808,15 +960,16 @@ impl LiveRuntime {
             && !is_initial;
         let commit = |dispatch: &mut HashMap<String, DispatchEntry>| {
             for (name, slot, func_id) in &compiled {
-                let arity = current
+                let sig = current
                     .iter()
                     .find(|(n, _)| n == name)
-                    .map(|(_, node)| node.signature.arity())
-                    .unwrap_or(0);
+                    .map(|(_, node)| Arc::new(node.signature.clone()))
+                    .unwrap_or_else(|| Arc::new(Signature::default()));
+                let arity = sig.arity();
                 let code = module.get_finalized_function(*func_id);
                 // Arity before code — the ordering the lock-free handle path relies on.
                 self.table.publish(*slot, arity, code as u64);
-                dispatch.insert(name.clone(), DispatchEntry { slot: *slot, arity });
+                dispatch.insert(name.clone(), DispatchEntry { slot: *slot, arity, sig });
             }
             for name in &removed {
                 let id = blaze_ir::function_id(&inner.db, name);

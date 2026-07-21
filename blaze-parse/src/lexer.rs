@@ -23,6 +23,8 @@ enum RawToken {
 
     #[token("int")]
     IntKw,
+    #[token("float")]
+    FloatKw,
     #[token("return")]
     ReturnKw,
     #[token("if")]
@@ -32,6 +34,10 @@ enum RawToken {
     #[token("while")]
     WhileKw,
 
+    // A decimal float literal (`3.14`). Declared before the integer rule but
+    // resolved by longest-match: `3.14` prefers this over `3` + `.` + `14`.
+    #[regex(r"[0-9]+\.[0-9]+")]
+    FloatLiteral,
     // A decimal integer literal. Values are parsed later during lowering; the
     // lexer only recognizes the shape.
     #[regex(r"[0-9]+")]
@@ -88,10 +94,12 @@ impl RawToken {
             RawToken::Whitespace => SyntaxKind::WHITESPACE,
             RawToken::LineComment => SyntaxKind::LINE_COMMENT,
             RawToken::IntKw => SyntaxKind::INT_KW,
+            RawToken::FloatKw => SyntaxKind::FLOAT_KW,
             RawToken::ReturnKw => SyntaxKind::RETURN_KW,
             RawToken::IfKw => SyntaxKind::IF_KW,
             RawToken::ElseKw => SyntaxKind::ELSE_KW,
             RawToken::WhileKw => SyntaxKind::WHILE_KW,
+            RawToken::FloatLiteral => SyntaxKind::FLOAT_LITERAL,
             RawToken::IntLiteral => SyntaxKind::INT_LITERAL,
             RawToken::Ident => SyntaxKind::IDENT,
             RawToken::LParen => SyntaxKind::L_PAREN,
@@ -192,6 +200,14 @@ mod tests {
         assert_eq!(kinds("<= >= == != < > = - /"), vec![
             LT_EQ, WHITESPACE, GT_EQ, WHITESPACE, EQ_EQ, WHITESPACE, NOT_EQ, WHITESPACE,
             LT, WHITESPACE, GT, WHITESPACE, EQ, WHITESPACE, MINUS, WHITESPACE, SLASH,
+        ]);
+    }
+
+    #[test]
+    fn floats_lex_distinctly_from_ints() {
+        use SyntaxKind::*;
+        assert_eq!(kinds("float x 3.14 42"), vec![
+            FLOAT_KW, WHITESPACE, IDENT, WHITESPACE, FLOAT_LITERAL, WHITESPACE, INT_LITERAL,
         ]);
     }
 
