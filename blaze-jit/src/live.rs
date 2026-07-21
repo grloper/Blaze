@@ -380,7 +380,7 @@ impl LiveRuntime {
     /// the runtime. It must not call back into this runtime.
     pub unsafe fn register_host_fn(&self, name: &str, arity: usize, ptr: *const u8) {
         let mut inner = self.inner.lock().unwrap();
-        let id = blaze_ir::function_id_of(name);
+        let id = blaze_ir::function_id(&inner.db, name);
         let slot = Self::ensure_slot(&mut inner, id);
         inner.host_fns.insert(name.to_string(), (arity, ptr as u64));
 
@@ -678,7 +678,7 @@ impl LiveRuntime {
                 dispatch.insert(name.clone(), DispatchEntry { slot: *slot, arity });
             }
             for name in &removed {
-                let id = blaze_ir::function_id_of(name);
+                let id = blaze_ir::function_id(&inner.db, name);
                 if let Some(&slot) = inner.slots.get(&id) {
                     self.table
                         .slot(slot)

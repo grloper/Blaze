@@ -17,9 +17,9 @@
 
 use std::sync::Arc;
 
-use blaze_ir::db::{BlazeDatabaseImpl, ExecTrace, FnKey};
+use blaze_ir::db::{function_id, BlazeDatabaseImpl, ExecTrace, FnKey};
 use blaze_ir::lower::{lowered_dev_ir, program_outline};
-use blaze_ir::{function_id_of, FunctionNode, IrOp, SourceProgram};
+use blaze_ir::{FunctionNode, IrOp, SourceProgram};
 use salsa::Setter;
 
 /// `add` is a leaf; `main` is its sole caller. Laid out so editing `add`'s body
@@ -86,9 +86,11 @@ fn outline_and_lowering_are_correct() {
     assert_eq!(add.body, vec![IrOp::Add(2, 0, 1), IrOp::Return(2)]);
     assert!(add.dependencies.is_empty(), "add is a leaf function");
 
-    // `main` calls `add`, so it must record `add` as a dependency.
+    // `main` calls `add`, so it must record `add` as a dependency — identified
+    // by its interned id, which is exactly what `add`'s own node carries.
     let main = ir_of(&db, src, "main");
-    assert_eq!(main.dependencies, vec![function_id_of("add")]);
+    assert_eq!(main.dependencies, vec![function_id(&db, "add")]);
+    assert_eq!(main.dependencies, vec![add.id], "the dep id must equal the callee's own id");
 }
 
 #[test]
