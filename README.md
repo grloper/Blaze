@@ -113,12 +113,15 @@ guarantee with a test hammering it from a second thread:
 | Per-function metrics are exact under concurrent callers, lock-free | `metrics.rs::counts_are_exact_under_concurrent_callers` — four threads hammer one slot; every increment lands |
 | Every reload (incl. `Rejected`/`NoEffect`) is journaled with its class, radius, diagnostics, and latency | `journal.rs::every_event_is_journaled_in_order` + `rejected_events_are_journaled_but_not_committed` |
 | `rollback(gen)` reverts through the same swap protocol, torn-free under a second thread | `journal.rs::rollback_reverts_a_body_edit` + `rollback_is_sound_under_concurrent_execution` (Relink variant: `rollback_across_an_abi_change_is_a_relink`) |
+| A canary's candidate answer never reaches a caller — even under a storm of concurrent mirrored calls | `canary.rs::the_caller_never_sees_the_candidate` + `the_shield_holds_under_concurrent_traffic` |
+| A wrong / faulting / too-slow candidate auto-aborts and cannot be promoted | `canary.rs::a_diverging_candidate_auto_aborts` + `a_faulting_candidate_auto_aborts` + `a_slow_candidate_auto_aborts_on_latency` + `an_aborted_candidate_cannot_be_promoted` |
+| Promoting a validated candidate is the ordinary classified swap, seamless under load | `canary.rs::a_matching_candidate_promotes_through_the_swap_protocol` + `promote_is_seamless_under_concurrent_traffic` |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 95 tests
+cargo test --workspace                                  # 106 tests
 cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
 cargo run -p blaze-jit --release --example bench_reload  # reload latency per edit class
 cargo run -p blaze-jit --release --example bench_calls   # call throughput (named vs handle)
@@ -159,6 +162,15 @@ rt.call("add", &[2, 3])?;
 let m = rt.metrics("add").unwrap();          // calls, total_nanos, faults
 let _ = rt.rollback(1)?;                       // back to generation 1, classified
 assert_eq!(rt.call("add", &[2, 3]), Ok(5));
+
+// Canary a candidate against live traffic. `call_canary` returns the LIVE
+// answer while shadowing the candidate; a wrong/slow one auto-aborts.
+use blaze_jit::CanaryPolicy;
+rt.canary("int add(int a, int b) { return b + a; }", CanaryPolicy::default())?;
+let _ = rt.call_canary("add", &[2, 3])?;       // always the live result
+if rt.canary_status().map(|s| s.verdict) == Some(blaze_jit::CanaryVerdict::Running) {
+    rt.promote()?;                             // classified swap, journaled
+}
 
 // Or bind to a file and poll once per frame:
 let mut host = ScriptHost::new("game/logic.blaze")?;
@@ -290,8 +302,13 @@ because nothing on it is shared.
   not a special path — it reinstalls that generation's source through the
   ordinary reload protocol, so a revert is itself classified, committed with
   the synchronization its class proves sound, and journaled as a new event
-- 🔜 In-process canary: mirror live traffic through a candidate generation
-  before promoting it, with an auto-abort policy
+- ✅ **In-process canary**: `canary(source, policy)` compiles an isolated
+  candidate and shadows it against the live program — a sampled fraction of
+  calls (routed through `call_canary`) run through both and the results are
+  compared, but the caller *always* gets the live answer, so a bad candidate
+  can never reach a real request. A wrong, faulting, or too-slow candidate
+  auto-aborts per policy and cannot be promoted; `promote()` reinstalls a
+  healthy candidate through the ordinary classified swap (and journals it)
 - 🔜 Richer types and explicit `int`↔`float` conversions (pure language growth;
   reload semantics unchanged)
 - 🔜 `StateMigration`: script-owned persistent state with layout versioning
