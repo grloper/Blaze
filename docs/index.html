@@ -1,0 +1,1129 @@
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Blaze — the live logic runtime</title>
+<meta name="description" content="Blaze hot-swaps functions in a running production process in ~500 microseconds — provably safe, canaried against live traffic, instantly reversible. For humans and for AI agents." />
+<meta name="theme-color" content="#0a0b0d" />
+<meta name="color-scheme" content="dark" />
+
+<!-- Open Graph / Twitter -->
+<meta property="og:type" content="website" />
+<meta property="og:title" content="Blaze — the live logic runtime" />
+<meta property="og:description" content="Swap functions in a running process in ~500µs — with a proof, a canary, and an undo button. And it is how you let an AI touch production logic without fear." />
+<meta property="og:url" content="https://grloper.github.io/Blaze/" />
+<meta property="og:site_name" content="Blaze" />
+<meta name="twitter:card" content="summary" />
+<meta name="twitter:title" content="Blaze — the live logic runtime" />
+<meta name="twitter:description" content="Swap functions in a running process in ~500µs — provably safe, canaried against live traffic, instantly reversible. For humans and for AI agents." />
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cpath%20fill='%23ff6b35'%20d='M12%202c3%204%201%206-1%208.5C9.4%2012.4%208%2014%208%2016a4%204%200%200%200%208%200c0-1-.3-2-.8-2.8%201.6.7%202.8%202.4%202.8%204.8a6%206%200%201%201-12%200c0-3%202-5%203.5-7C11%208%2012.5%205%2012%202Z'/%3E%3C/svg%3E" />
+
+<script>
+  /* Set flags before first paint so the terminal never flashes its final frame. */
+  (function () {
+    var d = document.documentElement;
+    d.classList.remove('no-js');
+    d.classList.add('js');
+    try {
+      if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+        d.classList.add('reduce-motion');
+      }
+    } catch (e) {}
+  })();
+</script>
+
+<style>
+  :root {
+    --bg:        #0a0b0d;
+    --bg-2:      #0d0f12;
+    --surface:   #121418;
+    --surface-2: #171a20;
+    --border:        rgba(255,255,255,0.09);
+    --border-strong: rgba(255,255,255,0.16);
+    --text:    #ecedef;
+    --muted:   #a3a8b0;
+    --muted-2: #767c86;
+    --ember:   #ff6b35;
+    --ember-2: #ff9142;
+    --ember-soft: rgba(255,107,53,0.13);
+    --green: #46c463;
+    --red:   #ff5f56;
+    --cyan:  #56d4dd;
+    --amber: #e9b64a;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji", sans-serif;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", "Cascadia Code", "Fira Code", Menlo, Consolas, "Liberation Mono", monospace;
+    --maxw: 1100px;
+    --radius: 14px;
+  }
+
+  * { box-sizing: border-box; }
+
+  html { -webkit-text-size-adjust: 100%; }
+  @media (prefers-reduced-motion: no-preference) {
+    html { scroll-behavior: smooth; }
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 17px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    overflow-x: hidden;
+  }
+
+  a { color: var(--ember-2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+
+  h1, h2, h3 { line-height: 1.15; letter-spacing: -0.02em; font-weight: 700; margin: 0; }
+  h2 { font-size: clamp(1.75rem, 1.2rem + 2.2vw, 2.6rem); }
+  h3 { font-size: 1.15rem; letter-spacing: -0.01em; }
+  p { margin: 0 0 1rem; }
+
+  ::selection { background: rgba(255,107,53,0.32); color: #fff; }
+
+  .wrap { width: 100%; max-width: var(--maxw); margin-inline: auto; padding-inline: 22px; }
+
+  section { padding-block: clamp(56px, 8vw, 104px); scroll-margin-top: 76px; position: relative; }
+  .divider { border-top: 1px solid var(--border); }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 0.78rem;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--ember);
+    margin: 0 0 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  .eyebrow::before { content: ""; width: 22px; height: 1px; background: var(--ember); opacity: 0.7; }
+
+  .lede { color: var(--muted); font-size: 1.12rem; max-width: 62ch; }
+  .section-head { margin-bottom: 40px; }
+
+  /* ---------- Buttons ---------- */
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    font: inherit; font-weight: 600; font-size: 0.98rem;
+    padding: 11px 20px; border-radius: 10px;
+    border: 1px solid transparent; cursor: pointer;
+    transition: transform .12s ease, background .2s ease, border-color .2s ease, box-shadow .2s ease;
+    text-decoration: none;
+  }
+  .btn:hover { text-decoration: none; transform: translateY(-1px); }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--ember), var(--ember-2));
+    color: #1a0d05;
+    box-shadow: 0 6px 26px -8px rgba(255,107,53,0.7);
+  }
+  .btn-primary:hover { box-shadow: 0 10px 34px -8px rgba(255,107,53,0.85); }
+  .btn-ghost { background: rgba(255,255,255,0.04); color: var(--text); border-color: var(--border-strong); }
+  .btn-ghost:hover { background: rgba(255,255,255,0.08); }
+
+  /* ---------- Command block + copy ---------- */
+  .cmd {
+    display: flex; align-items: stretch; gap: 0;
+    background: #0c0e11; border: 1px solid var(--border);
+    border-radius: 10px; overflow: hidden; font-family: var(--mono);
+  }
+  .cmd code {
+    flex: 1 1 auto; min-width: 0;
+    padding: 12px 14px; font-size: 0.86rem; color: #d7dbe2;
+    white-space: nowrap; overflow-x: auto; scrollbar-width: thin;
+  }
+  .cmd code .tok-prompt { color: var(--ember); user-select: none; }
+  .cmd code .tok-comment { color: var(--muted-2); }
+  .copy {
+    flex: 0 0 auto;
+    display: inline-flex; align-items: center; gap: 6px;
+    font: inherit; font-family: var(--font); font-size: 0.8rem; font-weight: 600;
+    padding: 0 14px; border: 0; border-left: 1px solid var(--border);
+    background: rgba(255,255,255,0.03); color: var(--muted); cursor: pointer;
+    transition: background .18s ease, color .18s ease;
+  }
+  .copy:hover { background: rgba(255,255,255,0.08); color: var(--text); }
+  .copy.copied { color: var(--green); }
+  .copy svg { width: 15px; height: 15px; }
+  .copy .ico-check { display: none; }
+  .copy.copied .ico-copy { display: none; }
+  .copy.copied .ico-check { display: inline; }
+
+  /* ---------- Header ---------- */
+  header.site {
+    position: sticky; top: 0; z-index: 50;
+    backdrop-filter: saturate(140%) blur(12px);
+    background: rgba(10,11,13,0.72);
+    border-bottom: 1px solid var(--border);
+  }
+  header.site .wrap { display: flex; align-items: center; justify-content: space-between; height: 58px; }
+  .brand { display: inline-flex; align-items: center; gap: 9px; font-weight: 700; letter-spacing: -0.01em; color: var(--text); }
+  .brand:hover { text-decoration: none; }
+  .brand svg { width: 22px; height: 22px; display: block; }
+  .nav { display: flex; align-items: center; gap: 26px; }
+  .nav a { color: var(--muted); font-size: 0.92rem; font-weight: 500; }
+  .nav a:hover { color: var(--text); text-decoration: none; }
+  .nav .nav-cta { color: var(--text); }
+  @media (max-width: 720px) { .nav a:not(.nav-cta) { display: none; } }
+
+  /* ---------- Hero ---------- */
+  .hero { position: relative; overflow: hidden; padding-top: clamp(60px, 9vw, 110px); padding-bottom: clamp(40px, 6vw, 72px); }
+  .hero-bg { position: absolute; inset: 0; z-index: 0; pointer-events: none; overflow: hidden; }
+  .hero-bg .glow {
+    position: absolute; border-radius: 50%; filter: blur(70px); opacity: 0.5;
+  }
+  .hero-bg .g1 { width: 620px; height: 620px; top: -280px; left: 50%; margin-left: -420px;
+    background: radial-gradient(circle, rgba(255,107,53,0.42), transparent 62%); }
+  .hero-bg .g2 { width: 520px; height: 520px; top: -150px; right: -160px;
+    background: radial-gradient(circle, rgba(255,145,66,0.24), transparent 62%); }
+  .hero-bg .g3 { width: 440px; height: 440px; top: 40px; left: -180px;
+    background: radial-gradient(circle, rgba(86,212,221,0.10), transparent 64%); }
+  .hero-bg .grid {
+    position: absolute; inset: 0;
+    background-image: linear-gradient(rgba(255,255,255,0.028) 1px, transparent 1px),
+                      linear-gradient(90deg, rgba(255,255,255,0.028) 1px, transparent 1px);
+    background-size: 46px 46px;
+    -webkit-mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 30%, transparent 78%);
+            mask-image: radial-gradient(ellipse 90% 60% at 50% 0%, #000 30%, transparent 78%);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .hero-bg .g1 { animation: drift1 16s ease-in-out infinite alternate; }
+    .hero-bg .g2 { animation: drift2 20s ease-in-out infinite alternate; }
+    @keyframes drift1 { from { transform: translate(-10px, 0) scale(1); } to { transform: translate(30px, 22px) scale(1.07); } }
+    @keyframes drift2 { from { transform: translate(0,0) scale(1); } to { transform: translate(-26px, 18px) scale(1.05); } }
+  }
+  .hero .wrap { position: relative; z-index: 1; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--mono); font-size: 0.76rem; letter-spacing: 0.02em;
+    color: var(--muted); background: rgba(255,255,255,0.04);
+    border: 1px solid var(--border); border-radius: 999px; padding: 5px 13px 5px 11px;
+    margin-bottom: 26px;
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+  .hero h1 {
+    font-size: clamp(2.5rem, 1.4rem + 5.4vw, 4.6rem);
+    letter-spacing: -0.035em; margin-bottom: 18px;
+    background: linear-gradient(180deg, #fff 30%, #c9ccd2 100%);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .hero .tagline { font-size: clamp(1.15rem, 1rem + 1vw, 1.5rem); color: var(--text); font-weight: 500; max-width: 24ch; margin-bottom: 8px; }
+  .hero .tagline .accent { color: var(--ember); }
+  .hero .subtag { color: var(--muted); font-size: 1.06rem; max-width: 60ch; margin-bottom: 30px; }
+
+  .quote {
+    border-left: 2px solid var(--ember); padding: 4px 0 4px 22px;
+    margin: 0 0 34px; font-size: 1.12rem; line-height: 1.55; color: #d9dce2; max-width: 58ch;
+  }
+  .quote b { color: #fff; font-weight: 700; }
+
+  .cta-row { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-bottom: 42px; }
+  .cta-row .cmd { max-width: 100%; }
+  @media (max-width: 640px) { .cta-row .cmd { width: 100%; } }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; }
+  @media (max-width: 720px) { .stats { grid-template-columns: repeat(2, 1fr); } }
+  .stat {
+    background: linear-gradient(180deg, var(--surface), rgba(18,20,24,0.4));
+    border: 1px solid var(--border); border-radius: 12px; padding: 18px 16px;
+  }
+  .stat .num { font-family: var(--mono); font-size: clamp(1.5rem, 1.1rem + 1.6vw, 2.05rem); font-weight: 700; color: #fff; letter-spacing: -0.02em; line-height: 1; }
+  .stat .num .u { color: var(--ember); font-size: 0.62em; margin-left: 2px; }
+  .stat .lbl { color: var(--muted); font-size: 0.82rem; margin-top: 9px; line-height: 1.35; }
+
+  /* ---------- Terminal centerpiece ---------- */
+  .term-shell {
+    background: linear-gradient(180deg, #101216, #0b0d10);
+    border: 1px solid var(--border-strong);
+    border-radius: 16px; overflow: hidden;
+    box-shadow: 0 40px 120px -50px rgba(0,0,0,0.9), 0 0 0 1px rgba(255,107,53,0.06);
+  }
+  .term-bar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    background: rgba(255,255,255,0.02);
+  }
+  .term-bar .dots { display: flex; gap: 7px; }
+  .term-bar .dots i { width: 12px; height: 12px; border-radius: 50%; display: block; }
+  .term-bar .dots i:nth-child(1){ background:#ff5f56; }
+  .term-bar .dots i:nth-child(2){ background:#ffbd2e; }
+  .term-bar .dots i:nth-child(3){ background:#27c93f; }
+  .term-bar .ttl { margin-left: 8px; font-family: var(--mono); font-size: 0.8rem; color: var(--muted-2); }
+  .term-body {
+    font-family: var(--mono); font-size: clamp(0.72rem, 0.6rem + 0.7vw, 0.92rem);
+    line-height: 1.75; padding: 22px clamp(14px, 3vw, 26px); color: #cfd3da;
+    overflow-x: auto;
+  }
+  .term-body .cmdline { color: #e9ebef; }
+  .term-body .cmdline .p { color: var(--ember); }
+  .term-body .banner { color: var(--ember-2); }
+  .term-body .served { color: #fff; }
+  .term-body .muted { color: var(--muted-2); }
+
+  .beat {
+    display: grid;
+    grid-template-columns: auto auto 1fr auto;
+    align-items: baseline; gap: 6px 12px;
+    padding: 4px 0;
+  }
+  .beat .idx { color: var(--muted-2); }
+  .beat .act { color: #e9ebef; white-space: nowrap; }
+  .beat .detail { color: var(--muted); }
+  .beat .metric { color: #cfd3da; text-align: right; white-space: nowrap; }
+  .beat .metric .drop0 { color: var(--green); }
+  @media (max-width: 620px) {
+    .beat { grid-template-columns: auto 1fr; }
+    .beat .metric { grid-column: 1 / -1; text-align: left; padding-left: 34px; }
+    .beat .detail { grid-column: 1 / -1; padding-left: 34px; }
+  }
+
+  .badge {
+    display: inline-block; font-weight: 700; font-size: 0.82em;
+    padding: 1px 9px; border-radius: 5px; color: #0a0b0d; white-space: nowrap;
+  }
+  .badge.safeswap { background: var(--green); }
+  .badge.rejected { background: var(--red); }
+  .badge.relink   { background: var(--cyan); }
+  .badge.canary   { background: var(--amber); }
+
+  .term-foot {
+    border-top: 1px dashed var(--border); margin-top: 14px; padding-top: 14px;
+    color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 14px; justify-content: space-between;
+  }
+  .term-foot .ok { color: var(--green); font-weight: 600; }
+
+  .term-cursor { display: inline-block; width: 9px; height: 1.05em; background: var(--ember); vertical-align: text-bottom; margin-left: 2px; }
+  html.js:not(.reduce-motion) .term-cursor { animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  html:not(.js) .term-cursor, html.reduce-motion .term-cursor { display: none; }
+
+  /* Reveal choreography: hidden only when JS is on and motion allowed. */
+  html.js:not(.reduce-motion) .term-line { opacity: 0; transform: translateY(5px); }
+  html.js:not(.reduce-motion) .term-line.show { opacity: 1; transform: none; transition: opacity .32s ease, transform .32s ease; }
+
+  .caption { color: var(--muted-2); font-family: var(--mono); font-size: 0.8rem; margin-top: 14px; text-align: center; }
+
+  /* ---------- Firewall diagram ---------- */
+  .firewall {
+    background: radial-gradient(120% 120% at 50% 0%, rgba(255,107,53,0.05), transparent 60%), var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: clamp(18px, 3vw, 30px);
+    margin-bottom: 36px;
+  }
+  .firewall svg { width: 100%; height: auto; display: block; }
+  .firewall .diagram text { font-family: var(--mono); }
+  .fw-note { color: var(--muted); font-size: 0.95rem; margin-top: 18px; text-align: center; max-width: 68ch; margin-inline: auto; }
+  .fw-note b { color: var(--text); }
+
+  /* ---------- Cards (edit classes) ---------- */
+  .cards { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+  @media (max-width: 720px) { .cards { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--surface); border: 1px solid var(--border);
+    border-left: 3px solid var(--accent, var(--border-strong));
+    border-radius: 12px; padding: 20px 22px;
+  }
+  .card.c-rejected { --accent: var(--red); }
+  .card.c-noeffect { --accent: var(--muted-2); }
+  .card.c-safeswap { --accent: var(--green); }
+  .card.c-relink   { --accent: var(--cyan); }
+  .card .chip {
+    display: inline-block; font-family: var(--mono); font-size: 0.74rem; font-weight: 700;
+    letter-spacing: 0.02em; padding: 3px 10px; border-radius: 6px; margin-bottom: 12px;
+    color: var(--accent); background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--accent) 32%, transparent);
+  }
+  .card h3 { margin-bottom: 8px; font-size: 1.02rem; }
+  .card p { margin: 0; color: var(--muted); font-size: 0.94rem; }
+  .card p .proto { color: var(--text); font-weight: 600; }
+
+  /* ---------- Tables ---------- */
+  .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 12px; -webkit-overflow-scrolling: touch; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.92rem; min-width: 560px; }
+  thead th {
+    text-align: left; font-family: var(--mono); font-size: 0.74rem; letter-spacing: 0.05em; text-transform: uppercase;
+    color: var(--muted-2); font-weight: 600; padding: 13px 16px; background: rgba(255,255,255,0.02);
+    border-bottom: 1px solid var(--border); white-space: nowrap;
+  }
+  tbody td { padding: 13px 16px; border-bottom: 1px solid var(--border); color: var(--muted); vertical-align: top; }
+  tbody tr:last-child td { border-bottom: 0; }
+  tbody td:first-child { color: var(--text); font-weight: 500; }
+  tbody tr.hl { background: rgba(255,107,53,0.06); }
+  tbody tr.hl td:first-child { color: var(--ember-2); }
+  .num-cell { font-family: var(--mono); color: var(--text) !important; white-space: nowrap; }
+  .yes { color: var(--green); font-weight: 600; }
+  .no { color: var(--red); font-weight: 600; }
+  .mono-sm { font-family: var(--mono); font-size: 0.86em; }
+
+  .bench-block { margin-bottom: 40px; }
+  .bench-block h3 { margin-bottom: 6px; }
+  .bench-block .sub { color: var(--muted); font-size: 0.94rem; margin-bottom: 16px; }
+  .bench-block .repro { margin-top: 14px; }
+  .repro .cmd code { font-size: 0.8rem; }
+  .machine-caveat {
+    display: flex; gap: 12px; align-items: flex-start;
+    background: var(--ember-soft); border: 1px solid rgba(255,107,53,0.22);
+    border-radius: 12px; padding: 16px 18px; margin-bottom: 34px; color: var(--muted); font-size: 0.94rem;
+  }
+  .machine-caveat svg { flex: 0 0 auto; width: 20px; height: 20px; color: var(--ember); margin-top: 2px; }
+  .machine-caveat b { color: var(--text); }
+
+  /* ---------- Agent pipeline ---------- */
+  .pipeline { display: flex; flex-wrap: wrap; align-items: stretch; gap: 10px; margin-bottom: 34px; }
+  .pstep {
+    flex: 1 1 130px; min-width: 120px;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 15px 14px; position: relative;
+  }
+  .pstep .n { font-family: var(--mono); font-size: 0.72rem; color: var(--ember); font-weight: 700; }
+  .pstep .t { font-weight: 600; margin-top: 5px; font-size: 0.96rem; color: var(--text); }
+  .pstep .d { color: var(--muted); font-size: 0.82rem; margin-top: 3px; line-height: 1.4; }
+  .pstep.abort { border-color: rgba(255,95,86,0.35); }
+  .pstep.abort .n { color: var(--red); }
+  .pstep.promote { border-color: rgba(70,196,99,0.35); }
+  .pstep.promote .n { color: var(--green); }
+
+  .scenario {
+    display: grid; grid-template-columns: auto 1fr; gap: 18px; align-items: start;
+    background: linear-gradient(180deg, rgba(233,182,74,0.07), transparent), var(--surface);
+    border: 1px solid rgba(233,182,74,0.28); border-radius: var(--radius);
+    padding: clamp(20px, 3vw, 28px); margin-bottom: 30px;
+  }
+  .scenario .glyph {
+    width: 44px; height: 44px; border-radius: 10px; display: grid; place-items: center;
+    background: rgba(233,182,74,0.14); color: var(--amber); flex: 0 0 auto;
+  }
+  .scenario .glyph svg { width: 24px; height: 24px; }
+  .scenario > div { min-width: 0; }
+  .scenario h3 { margin-bottom: 8px; }
+  .scenario p { margin: 0; color: var(--muted); }
+  .scenario p b { color: var(--text); }
+  .scenario .tag { display: block; font-family: var(--mono); font-size: 0.76rem; color: var(--amber); margin-top: 10px; overflow-wrap: anywhere; }
+  @media (max-width: 560px) { .scenario { grid-template-columns: 1fr; } }
+
+  .pullquote {
+    font-size: clamp(1.4rem, 1rem + 2vw, 2rem); font-weight: 600; letter-spacing: -0.02em;
+    line-height: 1.3; text-align: center; color: #fff; max-width: 24ch; margin: 8px auto 0;
+  }
+  .pullquote .accent { color: var(--ember); }
+
+  /* ---------- Claims → proofs ---------- */
+  .claim-intro {
+    font-size: 1.15rem; color: #d9dce2; max-width: 60ch; margin-bottom: 30px;
+  }
+  .claim-intro b { color: #fff; }
+  .claims { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .claim {
+    display: grid; grid-template-columns: 1fr auto; gap: 12px 20px; align-items: center;
+    padding: 16px 20px; border-bottom: 1px solid var(--border);
+    transition: background .15s ease;
+  }
+  .claim:last-child { border-bottom: 0; }
+  .claim:hover { background: rgba(255,107,53,0.05); }
+  .claim .txt { color: var(--text); font-size: 0.97rem; }
+  .claim { min-width: 0; }
+  .claim .txt { min-width: 0; }
+  .claim .proof {
+    font-family: var(--mono); font-size: 0.8rem; white-space: nowrap;
+    color: var(--muted); display: inline-flex; align-items: center; gap: 6px;
+    justify-self: end;
+  }
+  .claim .proof:hover { color: var(--ember-2); text-decoration: none; }
+  .claim .proof .file { color: var(--ember); }
+  .claim .proof svg { width: 13px; height: 13px; opacity: .7; flex: 0 0 auto; }
+  @media (max-width: 640px) {
+    .claim { grid-template-columns: 1fr; gap: 8px; }
+    .claim .proof { white-space: normal; overflow-wrap: anywhere; justify-self: start; }
+  }
+
+  /* ---------- Honest limits ---------- */
+  .limits { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  @media (max-width: 720px) { .limits { grid-template-columns: 1fr; } }
+  .limit {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px 20px;
+  }
+  .limit h3 { font-size: 0.98rem; margin-bottom: 6px; display: flex; align-items: center; gap: 9px; }
+  .limit h3::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--muted-2); flex: 0 0 auto; }
+  .limit p { margin: 0; color: var(--muted); font-size: 0.9rem; }
+  .limit code { font-family: var(--mono); font-size: 0.85em; color: var(--ember-2); background: rgba(255,107,53,0.08); padding: 1px 5px; border-radius: 4px; }
+
+  /* ---------- Footer ---------- */
+  footer.site { border-top: 1px solid var(--border); padding-block: 48px; }
+  footer.site .row { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 20px; }
+  footer.site .brand { font-size: 1.05rem; }
+  footer.site .meta { color: var(--muted-2); font-size: 0.86rem; }
+  footer.site .links { display: flex; gap: 22px; }
+  footer.site .links a { color: var(--muted); font-size: 0.9rem; }
+  footer.site .links a:hover { color: var(--text); text-decoration: none; }
+  footer .foot-cmd { margin-top: 26px; max-width: 460px; }
+
+  .prose code { font-family: var(--mono); font-size: 0.86em; color: var(--ember-2); background: rgba(255,107,53,0.08); padding: 1px 5px; border-radius: 4px; }
+
+  /* Reduce-motion / no-JS: never hide content. */
+  html.reduce-motion *, html:not(.js) * { animation: none !important; }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="Blaze — home">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><defs><linearGradient id="fl" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#ffb347"/><stop offset="1" stop-color="#ff5f2e"/></linearGradient></defs><path fill="url(#fl)" d="M12 2c3 4 1 6-1 8.5C9.4 12.4 8 14 8 16a4 4 0 0 0 8 0c0-1-.3-2-.8-2.8 1.6.7 2.8 2.4 2.8 4.8a6 6 0 1 1-12 0c0-3 2-5 3.5-7C11 8 12.5 5 12 2Z"/></svg>
+      Blaze
+    </a>
+    <nav class="nav" aria-label="Primary">
+      <a href="#demo">Demo</a>
+      <a href="#safe">How</a>
+      <a href="#benchmarks">Benchmarks</a>
+      <a href="#proofs">Proofs</a>
+      <a class="nav-cta" href="https://github.com/grloper/Blaze" rel="noopener">GitHub&nbsp;↗</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+  <!-- ==================== HERO ==================== -->
+  <section class="hero" aria-labelledby="hero-h1">
+    <div class="hero-bg" aria-hidden="true">
+      <span class="glow g1"></span>
+      <span class="glow g2"></span>
+      <span class="glow g3"></span>
+      <span class="grid"></span>
+    </div>
+    <div class="wrap">
+      <span class="pill"><span class="dot"></span> Sound hot reload · JIT-native · Apache-2.0</span>
+      <h1 id="hero-h1">The live logic runtime.</h1>
+      <p class="tagline">Swap a <span class="accent">function</span> in a running production process — in ~500&nbsp;microseconds.</p>
+      <p class="subtag">Provably safe. Canaried against live traffic. Instantly reversible. An embeddable JIT scripting runtime — for humans, and for AI agents.</p>
+
+      <blockquote class="quote">
+        “LaunchDarkly flips booleans. <b>Blaze swaps functions</b> — in 500&nbsp;microseconds, with a proof, a canary, and an undo button. And it is how you let an AI touch production logic without fear.”
+      </blockquote>
+
+      <div class="cta-row">
+        <div class="cmd" role="group" aria-label="Quick start command">
+          <code><span class="tok-prompt">$ </span>git clone https://github.com/grloper/Blaze &amp;&amp; cd Blaze &amp;&amp; cargo run -p blaze-jit --release --example living_service -- --script</code>
+          <button class="copy" type="button" aria-label="Copy quick-start command"
+            data-copy="git clone https://github.com/grloper/Blaze && cd Blaze && cargo run -p blaze-jit --release --example living_service -- --script">
+            <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+            <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+            <span class="copy-label">Copy</span>
+          </button>
+        </div>
+        <a class="btn btn-ghost" href="#proofs">Read the proofs →</a>
+      </div>
+
+      <div class="stats" aria-label="Key measured numbers">
+        <div class="stat">
+          <div class="num" data-count="496" data-suffix="µs">496µs</div>
+          <div class="lbl">body-edit hot-swap under live HTTP load</div>
+        </div>
+        <div class="stat">
+          <div class="num" data-count="51815" data-comma>51,815</div>
+          <div class="lbl">requests across 6 live edits · 0 dropped</div>
+        </div>
+        <div class="stat">
+          <div class="num" data-count="51" data-suffix="×">51×</div>
+          <div class="lbl">faster than an embedded interpreter, same rule</div>
+        </div>
+        <div class="stat">
+          <div class="num" data-count="110">110</div>
+          <div class="lbl">tests, each attacking a claim from a 2nd thread</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== TERMINAL CENTERPIECE ==================== -->
+  <section id="demo" class="divider" aria-labelledby="demo-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">See it run</p>
+        <h2 id="demo-h">A living service under fire.</h2>
+        <p class="lede">An HTTP risk-scoring service whose logic is a <code class="prose">.blaze</code> program, hot-swapped while thousands of requests per second pour through it. Six live edits — every beat asserted, over real HTTP, under load.</p>
+      </div>
+
+      <div class="term-shell" role="img" aria-label="Scripted living-service run: six live edits classified as SafeSwap, Rejected, canary-caught runaway, canary promote, Relink, and rollback — 51,815 requests served across 6 live edits, 0 dropped, all six guarantees asserted.">
+        <div class="term-bar">
+          <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span class="ttl">living_service — scripted run under load</span>
+        </div>
+        <div class="term-body" id="term-body">
+          <div class="term-line cmdline" data-line><span class="p">$ </span>cargo run -p blaze-jit --release --example living_service -- --script</div>
+          <div class="term-line banner" data-line>━━━ Blaze living-service — scripted run under load ━━━</div>
+          <div class="term-line served" data-line>served <b>51,815</b> requests across 6 live edits, <span style="color:var(--green)">0 dropped</span></div>
+          <div class="term-line" data-line>&nbsp;</div>
+
+          <div class="term-line beat" data-line>
+            <span class="idx">[1]</span><span class="act">body edit →</span>
+            <span class="detail"><span class="badge safeswap">SafeSwap</span> &nbsp;radius {velocity_risk}</span>
+            <span class="metric">496µs &nbsp; <span class="drop0">dropped 0</span></span>
+          </div>
+          <div class="term-line beat" data-line>
+            <span class="idx">[2]</span><span class="act">broken save →</span>
+            <span class="detail"><span class="badge rejected">Rejected</span> &nbsp;1 diagnostic; last-good serves on</span>
+            <span class="metric"><span class="drop0">dropped 0</span></span>
+          </div>
+          <div class="term-line beat" data-line>
+            <span class="idx">[3]</span><span class="act">runaway while(1) →</span>
+            <span class="detail"><span class="badge canary">canary</span> &nbsp;trapped FuelExhausted; auto-aborted, live untouched</span>
+            <span class="metric"><span class="drop0">dropped 0</span></span>
+          </div>
+          <div class="term-line beat" data-line>
+            <span class="idx">[4]</span><span class="act">risky rule →</span>
+            <span class="detail"><span class="badge canary">canary</span> &nbsp;saw 309 divergences; promoted as SafeSwap</span>
+            <span class="metric"><span class="drop0">dropped 0</span></span>
+          </div>
+          <div class="term-line beat" data-line>
+            <span class="idx">[5]</span><span class="act">ABI change →</span>
+            <span class="detail"><span class="badge relink">Relink</span> &nbsp;radius {velocity_risk, score}</span>
+            <span class="metric">1.08ms &nbsp; <span class="drop0">dropped 0</span></span>
+          </div>
+          <div class="term-line beat" data-line>
+            <span class="idx">[6]</span><span class="act">rollback to gen 1 →</span>
+            <span class="detail"><span class="badge relink">Relink</span> &nbsp;values exact</span>
+            <span class="metric">1.28ms &nbsp; <span class="drop0">dropped 0</span></span>
+          </div>
+
+          <div class="term-line" data-line>&nbsp;</div>
+          <div class="term-line muted" data-line>steady-state scoring latency: p50 64ns, p99 512ns</div>
+          <div class="term-line term-foot" data-line>
+            <span>served <span class="served">51,815</span> requests across 6 live edits, 0 dropped</span>
+            <span class="ok">all six guarantees asserted ✓<span class="term-cursor" aria-hidden="true"></span></span>
+          </div>
+        </div>
+      </div>
+      <p class="caption">Recorded deterministically from <code class="prose">docs/living_service.tape</code>. Hammered from four threads by <code class="prose">tests/living_service.rs</code>.</p>
+    </div>
+  </section>
+
+  <!-- ==================== HOW IT CAN BE SAFE ==================== -->
+  <section id="safe" class="divider" aria-labelledby="safe-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">How it can be safe</p>
+        <h2 id="safe-h">The firewall: callers read the <span style="color:var(--ember)">signature</span>, not the body.</h2>
+        <p class="lede">Blaze is an incremental compiler first. Source is a fine-grained salsa query graph in which a function’s lowered IR depends on its own text and its callees’ <em>signatures</em> — never their bodies. That asymmetry makes every edit’s blast radius a computed fact, not a guess.</p>
+      </div>
+
+      <div class="firewall">
+        <svg class="diagram" viewBox="0 0 820 414" role="img" aria-label="Firewall dependency graph: raw source feeds function_text(f), which splits into function_signature(f) and lowered_dev_ir(f), which produces compiled_machine_code(f). Callers depend only on the signature, never the body.">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--muted-2)"/>
+            </marker>
+            <marker id="arrow-ember" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7.5" markerHeight="7.5" orient="auto-start-reverse">
+              <path d="M0 0 L10 5 L0 10 z" fill="var(--ember)"/>
+            </marker>
+          </defs>
+
+          <!-- edges -->
+          <g fill="none" stroke="var(--muted-2)" stroke-width="1.6">
+            <path d="M410 62 L410 96" marker-end="url(#arrow)"/>
+            <path d="M410 148 L410 176 L225 176 L225 206" marker-end="url(#arrow)"/>
+            <path d="M410 148 L410 176 L565 176 L565 206" marker-end="url(#arrow)"/>
+            <path d="M565 256 L565 300" marker-end="url(#arrow)"/>
+          </g>
+          <!-- firewall edge: lowered IR reads callee signature -->
+          <path d="M470 250 C 405 316, 300 316, 300 258" fill="none" stroke="var(--ember)" stroke-width="2.2" stroke-dasharray="1 0" marker-end="url(#arrow-ember)"/>
+          <text x="268" y="384" text-anchor="middle" fill="var(--ember)" font-size="14" font-weight="700">reads the SIGNATURE — never the body</text>
+
+          <!-- nodes -->
+          <g>
+            <rect x="330" y="22" width="160" height="40" rx="8" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+            <text x="410" y="47" text-anchor="middle" fill="var(--muted)" font-size="14">raw source (input)</text>
+
+            <rect x="300" y="96" width="220" height="52" rx="9" fill="#1b1f26" stroke="var(--ember)" stroke-opacity="0.55"/>
+            <text x="410" y="127" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="600">function_text(f)</text>
+            <text x="536" y="126" fill="var(--ember)" font-size="12.5">← firewall node</text>
+
+            <rect x="120" y="206" width="210" height="52" rx="9" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+            <text x="225" y="237" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="600">function_signature(f)</text>
+
+            <rect x="470" y="206" width="190" height="52" rx="9" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+            <text x="565" y="237" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="600">lowered_dev_ir(f)</text>
+
+            <rect x="445" y="300" width="240" height="52" rx="9" fill="var(--surface-2)" stroke="var(--border-strong)"/>
+            <text x="565" y="331" text-anchor="middle" fill="var(--text)" font-size="15" font-weight="600">compiled_machine_code(f)</text>
+          </g>
+        </svg>
+        <p class="fw-note">An edit to a function’s <b>body</b> re-lowers only that function — every caller is a byte-for-byte memo hit. An edit to its <b>signature</b> forces exactly the callers that read it into the radius. <b>The graph computes the blast radius as a byproduct of recompiling the edit.</b></p>
+      </div>
+
+      <div class="cards">
+        <div class="card c-rejected">
+          <span class="chip">Rejected</span>
+          <h3>A defect is proven — nothing goes live</h3>
+          <p>Syntax error, undefined callee, arity or type mismatch, undefined variable. <span class="proto">Nothing is compiled or patched;</span> the previous known-good generation keeps serving every call untouched.</p>
+        </div>
+        <div class="card c-noeffect">
+          <span class="chip">NoEffect</span>
+          <h3>The edit changed nothing that matters</h3>
+          <p>No function’s IR changed — a comment, whitespace. <span class="proto">Zero codegen, zero generations,</span> and it costs nothing at all.</p>
+        </div>
+        <div class="card c-safeswap">
+          <span class="chip">SafeSwap</span>
+          <h3>A body changed, signatures held</h3>
+          <p><span class="proto">One lock-free atomic pointer store</span> — valid under concurrent execution, because the firewall guarantees no caller’s code mentions anything about the callee but its slot.</p>
+        </div>
+        <div class="card c-relink">
+          <span class="chip">Relink</span>
+          <h3>A signature moved (or a function was removed)</h3>
+          <p>The graph forces every caller in the radius. <span class="proto">The whole proven set recompiles and commits under a quiescence barrier</span> — mismatched caller/callee ABIs are never observable.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== THE CATEGORY ==================== -->
+  <section id="category" class="divider" aria-labelledby="cat-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">The category</p>
+        <h2 id="cat-h">Everything else guesses, flips, or restarts.</h2>
+        <p class="lede">Live behavior change isn’t new — but every existing approach trades away granularity, proof, or speed. Blaze keeps all three.</p>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Approach</th>
+              <th scope="col">Unit of change</th>
+              <th scope="col">Where it runs</th>
+              <th scope="col">Reload speed</th>
+              <th scope="col">Proven radius</th>
+              <th scope="col">Per-rule canary</th>
+              <th scope="col">Rollback</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>LaunchDarkly</td>
+              <td>Boolean / config flags</td>
+              <td>SaaS eval ($20k+/yr)</td>
+              <td class="num-cell">flag flip</td>
+              <td class="no">n/a (no code)</td>
+              <td class="no">✗</td>
+              <td>flag off</td>
+            </tr>
+            <tr>
+              <td>OPA / Rego</td>
+              <td>Whole policy bundle</td>
+              <td>In-process</td>
+              <td class="num-cell">whole-bundle reload</td>
+              <td class="no">✗</td>
+              <td class="no">✗</td>
+              <td>redeploy bundle</td>
+            </tr>
+            <tr>
+              <td>Sandbox / microVM</td>
+              <td>Whole script / process</td>
+              <td>Out-of-process</td>
+              <td class="num-cell">seconds (spin-up)</td>
+              <td class="no">✗</td>
+              <td class="no">✗</td>
+              <td>restart</td>
+            </tr>
+            <tr>
+              <td>dlopen / hot-patch</td>
+              <td>Native library</td>
+              <td>In-process</td>
+              <td class="num-cell">ms, guessed diff</td>
+              <td class="no">✗ guessed</td>
+              <td class="no">✗</td>
+              <td>reload library</td>
+            </tr>
+            <tr class="hl">
+              <td>Blaze</td>
+              <td>Individual functions</td>
+              <td>In-process JIT</td>
+              <td class="num-cell">~500µs, proven</td>
+              <td class="yes">✓ per edit</td>
+              <td class="yes">✓ live traffic</td>
+              <td class="yes">✓ one call</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== FOR AI AGENTS ==================== -->
+  <section id="agents" class="divider" aria-labelledby="agent-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">For AI agents</p>
+        <h2 id="agent-h">Let an AI touch production logic — without fear.</h2>
+        <p class="lede">The same pipeline that protects a human protects an autonomous editor. Every proposed edit runs a gauntlet before it can reach a real request.</p>
+      </div>
+
+      <div class="pipeline" role="list" aria-label="Agent edit pipeline">
+        <div class="pstep" role="listitem"><div class="n">01</div><div class="t">Propose</div><div class="d">The agent writes a candidate function.</div></div>
+        <div class="pstep" role="listitem"><div class="n">02</div><div class="t">Gate</div><div class="d">Diagnostics prove it well-formed, or Reject it.</div></div>
+        <div class="pstep" role="listitem"><div class="n">03</div><div class="t">Offline eval</div><div class="d">Scored against a reference test set.</div></div>
+        <div class="pstep" role="listitem"><div class="n">04</div><div class="t">Canary</div><div class="d">Shadow-run on sampled live traffic.</div></div>
+        <div class="pstep promote" role="listitem"><div class="n">05</div><div class="t">Promote / Abort</div><div class="d">Clean → classified swap. Bad → auto-abort.</div></div>
+        <div class="pstep" role="listitem"><div class="n">06</div><div class="t">Metrics</div><div class="d">Lock-free counters confirm the outcome.</div></div>
+      </div>
+
+      <div class="scenario">
+        <div class="glyph" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z"/></svg>
+        </div>
+        <div>
+          <h3>The killer scenario: an edit that passes every offline test.</h3>
+          <p>A candidate clears the whole offline eval set — then <b>loops forever</b> on an input shape the eval set never covered. The canary shadow-executes it on a sampled slice of live traffic, under the primary’s own fuel budget, and traps <code class="prose">FuelExhausted</code>. It <b>auto-aborts and is never promoted.</b> The caller only ever saw the live answer.</p>
+          <span class="tag">→ asserted in agent_loop.rs::the_agent_pipeline_keeps_every_bad_edit_out_of_production</span>
+        </div>
+      </div>
+
+      <p class="pullquote">“The blast radius of a bad idea is a <span class="accent">shadow execution</span>, not an outage.”</p>
+    </div>
+  </section>
+
+  <!-- ==================== BENCHMARKS ==================== -->
+  <section id="benchmarks" class="divider" aria-labelledby="bench-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">Benchmarks</p>
+        <h2 id="bench-h">Real numbers, honestly labeled.</h2>
+      </div>
+
+      <div class="machine-caveat">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+        <div>Every number below is single-run, release mode, <b>measured on this repo’s dev container</b> — a modest, shared cloud box. They vary run to run; the ratios and orders of magnitude are the point, and the structural claims survive any hardware. Each table ships a <code class="prose">cargo run</code> you can reproduce.</div>
+      </div>
+
+      <div class="bench-block">
+        <h3>Reload latency, per edit class</h3>
+        <p class="sub"><code class="prose">bench_reload</code> — a 40-function call chain where every function transitively depends on the edited leaf; median of repeated edits.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Event</th><th scope="col">Latency</th></tr></thead>
+            <tbody>
+              <tr><td>Full cold compile <span class="mono-sm" style="color:var(--muted-2)">(≈ a restart’s compile cost)</span></td><td class="num-cell">8.5 ms</td></tr>
+              <tr class="hl"><td>Body edit → SafeSwap <span class="mono-sm" style="color:var(--muted-2)">(radius 1 of 40)</span></td><td class="num-cell">0.74 ms</td></tr>
+              <tr><td>Comment → NoEffect <span class="mono-sm" style="color:var(--muted-2)">(radius 0)</span></td><td class="num-cell">0.54 ms</td></tr>
+              <tr><td>ABI edit → Relink <span class="mono-sm" style="color:var(--muted-2)">(radius 2)</span></td><td class="num-cell">1.9 ms</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="repro">
+          <div class="cmd">
+            <code><span class="tok-prompt">$ </span>cargo run -p blaze-jit --release --example bench_reload</code>
+            <button class="copy" type="button" aria-label="Copy bench_reload command" data-copy="cargo run -p blaze-jit --release --example bench_reload">
+              <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+              <span class="copy-label">Copy</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-block">
+        <h3>Call throughput</h3>
+        <p class="sub"><code class="prose">bench_calls</code> / <code class="prose">bench_vs_interpreter</code> — a trivial leaf (dispatch cost), and the same branchy risk rule vs. an embedded interpreter (<code class="prose">rhai</code>), cross-checked to agree on every input.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Path</th><th scope="col">Throughput</th></tr></thead>
+            <tbody>
+              <tr><td><code class="mono-sm" style="color:var(--ember-2)">call(name)</code> <span class="mono-sm" style="color:var(--muted-2)">— lock + string lookup per call</span></td><td class="num-cell">~19 M calls/s/thread</td></tr>
+              <tr class="hl"><td><code class="mono-sm" style="color:var(--ember-2)">call_handle</code> <span class="mono-sm" style="color:var(--muted-2)">— resolve once, then lock-free</span></td><td class="num-cell">~50 M calls/s/thread</td></tr>
+              <tr><td><code class="mono-sm" style="color:var(--ember-2)">call_handle</code>, 4 threads <span class="mono-sm" style="color:var(--muted-2)">(~94% linear)</span></td><td class="num-cell">~188 M calls/s</td></tr>
+              <tr><td>rhai <code class="mono-sm" style="color:var(--ember-2)">call_fn</code> <span class="mono-sm" style="color:var(--muted-2)">— AST interpreter, same rule</span></td><td class="num-cell">~0.96 M calls/s/thread</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="sub" style="margin-top:14px;margin-bottom:0"><b style="color:var(--ember-2)">~51×</b> the interpreter on identical logic — and still hot-swappable, which a compiled <code class="prose">dylib</code> is not. That is the “swap functions, don’t flip booleans” number.</p>
+        <div class="repro">
+          <div class="cmd">
+            <code><span class="tok-prompt">$ </span>cargo run -p blaze-jit --release --example bench_vs_interpreter</code>
+            <button class="copy" type="button" aria-label="Copy bench_vs_interpreter command" data-copy="cargo run -p blaze-jit --release --example bench_vs_interpreter">
+              <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+              <span class="copy-label">Copy</span>
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <div class="bench-block" style="margin-bottom:0">
+        <h3>Canary overhead on the live path</h3>
+        <p class="sub"><code class="prose">bench_canary</code> — what <code class="prose">call_canary</code> costs the live path, on a ~46 ns leaf so the deltas are visible. The caller always gets the live answer.</p>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th scope="col">Mode</th><th scope="col">Overhead</th></tr></thead>
+            <tbody>
+              <tr><td>Idle <span class="mono-sm" style="color:var(--muted-2)">(no candidate — one atomic load)</span></td><td class="num-cell">+~4 ns/call</td></tr>
+              <tr class="hl"><td>Shadowing 1% of calls <span class="mono-sm" style="color:var(--muted-2)">(lock-free sampler)</span></td><td class="num-cell">+~4 ns/call</td></tr>
+              <tr><td>Shadowing 100% of calls <span class="mono-sm" style="color:var(--muted-2)">(a full shadow every call)</span></td><td class="num-cell">+~220 ns/call</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="repro">
+          <div class="cmd">
+            <code><span class="tok-prompt">$ </span>cargo run -p blaze-jit --release --example bench_canary</code>
+            <button class="copy" type="button" aria-label="Copy bench_canary command" data-copy="cargo run -p blaze-jit --release --example bench_canary">
+              <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+              <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+              <span class="copy-label">Copy</span>
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== CLAIMS → PROOFS ==================== -->
+  <section id="proofs" class="divider" aria-labelledby="proofs-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">Claims → proofs</p>
+        <h2 id="proofs-h">Every claim is a theorem with a test.</h2>
+        <p class="claim-intro">Every <b>“instant”</b>, <b>“safe”</b>, and <b>“proven”</b> on this page traces to a named test that attacks the guarantee <b>from a second thread</b> while it holds. Here are the strongest — each links to its function on GitHub.</p>
+      </div>
+
+      <div class="claims">
+        <div class="claim">
+          <span class="txt">A body edit swaps live under concurrent calls — zero missed calls, zero torn values.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/live.rs#L114" rel="noopener"><span class="file">live.rs</span>::body_edit_swaps_under_concurrent_execution <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">An ABI edit is classified <span style="color:var(--cyan)">Relink</span> and transitions atomically — observed values are only ever fully-old or fully-new.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/live.rs#L164" rel="noopener"><span class="file">live.rs</span>::signature_edit_relinks_atomically_under_fire <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">A syntax error is <span style="color:var(--red)">Rejected</span>; last-good keeps answering every concurrent call.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/live.rs#L257" rel="noopener"><span class="file">live.rs</span>::syntax_error_holds_last_good_under_concurrent_execution <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">Unbounded recursion aborts the <em>call</em> with a typed error — it never faults the host.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/live.rs#L369" rel="noopener"><span class="file">live.rs</span>::unbounded_recursion_aborts_with_error_not_a_crash <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">An infinite loop aborts with <code class="prose">FuelExhausted</code>, never hangs — the runtime is healthy afterward.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/live.rs#L518" rel="noopener"><span class="file">live.rs</span>::infinite_loop_aborts_with_fuel_exhausted <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">The fast <code class="prose">FuncHandle</code> path is torn-free under concurrent hot-swaps.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/live.rs#L700" rel="noopener"><span class="file">live.rs</span>::handle_calls_are_correct_under_concurrent_body_swap <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">A canary’s candidate answer never reaches a caller — even under a storm of mirrored calls.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/canary.rs#L47" rel="noopener"><span class="file">canary.rs</span>::the_caller_never_sees_the_candidate <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">A diverging candidate auto-aborts and cannot be promoted.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/canary.rs#L101" rel="noopener"><span class="file">canary.rs</span>::a_diverging_candidate_auto_aborts <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt"><code class="prose">rollback(gen)</code> reverts through the same swap protocol, torn-free under a second thread.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/journal.rs#L154" rel="noopener"><span class="file">journal.rs</span>::rollback_is_sound_under_concurrent_execution <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">A live-edited <code class="prose">x / 0</code> cannot fault the host — division is guarded in codegen.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/jit.rs#L123" rel="noopener"><span class="file">jit.rs</span>::division_is_guarded_and_cannot_fault_the_process <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">Per-function metrics are exact under concurrent callers, lock-free.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/metrics.rs#L121" rel="noopener"><span class="file">metrics.rs</span>::counts_are_exact_under_concurrent_callers <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt"><b>The whole living-service story</b> — six live edits under sustained load, each classified as claimed, zero dropped calls.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/living_service.rs#L76" rel="noopener"><span class="file">living_service.rs</span>::the_living_service_story_holds_under_load <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+        <div class="claim">
+          <span class="txt">An autonomous agent’s gate + eval + canary pipeline keeps every bad edit out of production.</span>
+          <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/agent_loop.rs#L15" rel="noopener"><span class="file">agent_loop.rs</span>::the_agent_pipeline_keeps_every_bad_edit_out_of_production <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== HONEST LIMITS ==================== -->
+  <section id="limits" class="divider" aria-labelledby="limits-h">
+    <div class="wrap">
+      <div class="section-head">
+        <p class="eyebrow">Honest limits</p>
+        <h2 id="limits-h">A focused core, not a general language.</h2>
+        <p class="lede">What Blaze deliberately does <em>not</em> do yet — so you know before you build on it. None of these change the reload and safety guarantees.</p>
+      </div>
+
+      <div class="limits">
+        <div class="limit">
+          <h3>One file, one flat namespace</h3>
+          <p>A program is a single <code>.blaze</code> source of top-level functions. No modules, no imports.</p>
+        </div>
+        <div class="limit">
+          <h3>Two scalar types only</h3>
+          <p><code>int</code> (i64) and <code>float</code> (f64). No strings, arrays, structs, or pointers — which is also <em>why</em> a script can’t corrupt the host: there are no memory operations to abuse.</p>
+        </div>
+        <div class="limit">
+          <h3>State lives in the host</h3>
+          <p>Blaze functions are pure over their scalar arguments; all persistent state is the embedder’s. That is exactly what makes state survive every reload.</p>
+        </div>
+        <div class="limit">
+          <h3>Retired code is retained, not freed</h3>
+          <p>A concurrent caller may still be inside an old generation mid-swap, so old code pages stay mapped. The cost grows with edit count × edited-function size.</p>
+        </div>
+        <div class="limit">
+          <h3>A canary re-executes each sampled call</h3>
+          <p>Mirror only logic free of observable host side effects (the norm for scoring functions). A canary is an evaluation mode, not steady state.</p>
+        </div>
+        <div class="limit">
+          <h3><code>StateMigration</code> is reserved</h3>
+          <p>A reserved <code>EditClass</code> for when script-owned persistent state lands with layout versioning. Today it cannot occur.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ==================== FOOTER ==================== -->
+<footer class="site">
+  <div class="wrap">
+    <div class="row">
+      <a class="brand" href="#top">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path fill="url(#fl)" d="M12 2c3 4 1 6-1 8.5C9.4 12.4 8 14 8 16a4 4 0 0 0 8 0c0-1-.3-2-.8-2.8 1.6.7 2.8 2.4 2.8 4.8a6 6 0 1 1-12 0c0-3 2-5 3.5-7C11 8 12.5 5 12 2Z"/></svg>
+        Blaze
+      </a>
+      <div class="links">
+        <a href="https://github.com/grloper/Blaze" rel="noopener">GitHub</a>
+        <a href="#demo">Demo</a>
+        <a href="#proofs">Proofs</a>
+        <a href="#benchmarks">Benchmarks</a>
+      </div>
+      <span class="meta">Apache-2.0 · The live logic runtime</span>
+    </div>
+    <div class="foot-cmd">
+      <div class="cmd">
+        <code><span class="tok-prompt">$ </span>cargo test --workspace <span class="tok-comment"># 110 tests</span></code>
+        <button class="copy" type="button" aria-label="Copy test command" data-copy="cargo test --workspace">
+          <svg class="ico-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>
+          <svg class="ico-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>
+          <span class="copy-label">Copy</span>
+        </button>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+(function () {
+  var doc = document.documentElement;
+  var reduce = doc.classList.contains('reduce-motion');
+
+  /* ---------- Copy buttons ---------- */
+  function attachCopy(btn) {
+    btn.addEventListener('click', function () {
+      var text = btn.getAttribute('data-copy') || '';
+      var done = function () {
+        btn.classList.add('copied');
+        var label = btn.querySelector('.copy-label');
+        var prev = label ? label.textContent : null;
+        if (label) label.textContent = 'Copied';
+        setTimeout(function () {
+          btn.classList.remove('copied');
+          if (label && prev !== null) label.textContent = prev;
+        }, 1400);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () { fallback(text, done); });
+      } else {
+        fallback(text, done);
+      }
+    });
+  }
+  function fallback(text, done) {
+    try {
+      var ta = document.createElement('textarea');
+      ta.value = text; ta.setAttribute('readonly', '');
+      ta.style.position = 'absolute'; ta.style.left = '-9999px';
+      document.body.appendChild(ta); ta.select();
+      document.execCommand('copy'); document.body.removeChild(ta);
+      done();
+    } catch (e) {}
+  }
+  var copyBtns = document.querySelectorAll('.copy');
+  for (var i = 0; i < copyBtns.length; i++) attachCopy(copyBtns[i]);
+
+  /* ---------- Count-up on hero stats ---------- */
+  function formatNum(v, comma) {
+    var s = Math.round(v).toString();
+    if (comma) s = s.replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+    return s;
+  }
+  function countUp(el) {
+    var target = parseFloat(el.getAttribute('data-count'));
+    var comma = el.hasAttribute('data-comma');
+    var suffix = el.getAttribute('data-suffix') || '';
+    var render = function (v) {
+      el.textContent = formatNum(v, comma) + suffix;
+    };
+    if (reduce) { render(target); return; }
+    var dur = 1300, start = null;
+    function step(ts) {
+      if (start === null) start = ts;
+      var p = Math.min(1, (ts - start) / dur);
+      var eased = 1 - Math.pow(1 - p, 3);
+      render(target * eased);
+      if (p < 1) requestAnimationFrame(step);
+      else render(target);
+    }
+    requestAnimationFrame(step);
+  }
+
+  /* ---------- Terminal reveal ---------- */
+  function playTerminal(container) {
+    if (reduce) return; /* lines already visible via CSS */
+    var lines = container.querySelectorAll('.term-line');
+    var delay = 0;
+    for (var i = 0; i < lines.length; i++) {
+      (function (line, d) {
+        setTimeout(function () { line.classList.add('show'); }, d);
+      })(lines[i], delay);
+      /* blank spacer lines flash by quickly; content beats get a beat */
+      delay += (lines[i].textContent.trim() === '') ? 90 : 300;
+    }
+  }
+
+  /* ---------- IntersectionObserver wiring ---------- */
+  var supportsIO = 'IntersectionObserver' in window;
+
+  var statNums = document.querySelectorAll('.stat .num[data-count]');
+  var term = document.getElementById('term-body');
+
+  if (!supportsIO) {
+    for (var s = 0; s < statNums.length; s++) countUp(statNums[s]);
+    if (term) { var tl = term.querySelectorAll('.term-line'); for (var t = 0; t < tl.length; t++) tl[t].classList.add('show'); }
+    return;
+  }
+
+  var statObserver = new IntersectionObserver(function (entries, obs) {
+    entries.forEach(function (e) {
+      if (e.isIntersecting) { countUp(e.target); obs.unobserve(e.target); }
+    });
+  }, { threshold: 0.6 });
+  for (var n = 0; n < statNums.length; n++) statObserver.observe(statNums[n]);
+
+  if (term) {
+    var termObserver = new IntersectionObserver(function (entries, obs) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { playTerminal(term); obs.disconnect(); }
+      });
+    }, { threshold: 0.3 });
+    termObserver.observe(term);
+  }
+})();
+</script>
+
+</body>
+</html>
