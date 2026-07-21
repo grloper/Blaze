@@ -11,9 +11,13 @@
 //! for the machine-checked proof of that property.
 
 pub mod db;
+pub mod diag;
 pub mod ir;
 pub mod lower;
 
-pub use db::{BlazeDatabase, BlazeDatabaseImpl, ExecTrace, FnKey, HasExecTrace, SourceProgram};
+pub use db::{
+    BlazeDatabase, BlazeDatabaseImpl, ExecTrace, FnKey, HasExecTrace, HostFunctions, SourceProgram,
+};
+pub use diag::{format_diagnostics, function_diagnostics, program_diagnostics, Diagnostic};
 pub use ir::{function_id_of, CmpKind, FunctionId, FunctionNode, IrBuilder, IrOp, Signature, Type};
 pub use lower::{function_signature, function_text, lowered_dev_ir, parse_program, program_outline};

@@ -56,6 +56,7 @@ fn spawn(rng: &mut Rng) -> Particle {
 
 fn class_tag(class: EditClass) -> &'static str {
     match class {
+        EditClass::Rejected => "Rejected ",
         EditClass::NoEffect => "NoEffect ",
         EditClass::SafeSwap => "SafeSwap ",
         EditClass::Relink => "Relink   ",
@@ -64,6 +65,18 @@ fn class_tag(class: EditClass) -> &'static str {
 }
 
 fn describe(report: &ReloadReport) -> String {
+    if report.class == EditClass::Rejected {
+        let first = report
+            .diagnostics
+            .first()
+            .map(|(f, d)| format!("{f}: {}", d.message))
+            .unwrap_or_default();
+        return format!(
+            "[gen {}] Rejected  {} problem(s), e.g. {first} — last-good still serving",
+            report.generation,
+            report.diagnostics.len(),
+        );
+    }
     let radius = if report.changed.is_empty() {
         "∅".to_string()
     } else {
