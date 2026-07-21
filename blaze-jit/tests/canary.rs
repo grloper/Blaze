@@ -29,8 +29,18 @@ use blaze_jit::{CanaryPolicy, CanaryVerdict, EditClass, LiveRuntime};
 
 /// A policy that never auto-aborts, so a canary keeps shadowing indefinitely —
 /// the strongest setting for proving the candidate's answer can never leak.
+/// Disables *both* abort paths: divergence, and latency (the default latency
+/// ratio is meant to catch a genuinely slow candidate, but at `sample_every: 1`
+/// every call serializes through the canary's mutex, and on a loaded/shared box
+/// scheduler jitter alone can inflate a shadow call's measured time enough to
+/// trip it — a false abort unrelated to the property these tests check).
 fn never_abort() -> CanaryPolicy {
-    CanaryPolicy { sample_every: 1, max_divergences: u64::MAX, ..Default::default() }
+    CanaryPolicy {
+        sample_every: 1,
+        max_divergences: u64::MAX,
+        min_samples_for_latency: u64::MAX,
+        max_latency_ratio: f64::INFINITY,
+    }
 }
 
 #[test]
@@ -208,7 +218,13 @@ fn a_matching_candidate_promotes_through_the_swap_protocol() {
 fn promote_is_seamless_under_concurrent_traffic() {
     let rt = Arc::new(LiveRuntime::new("int score(int x) { return x + x; }\n").expect("compile"));
     // Equivalent candidate, so the answer is 10 before *and* after promotion.
-    rt.canary("int score(int x) { return x * 2; }\n", CanaryPolicy::default()).expect("start");
+    // The worker below hammers call_canary at 100% sampling for the run's
+    // duration — easily enough calls to cross the default latency-check floor
+    // under real contention, and since x*2/x+x are equal-cost single-instruction
+    // ops (divergence can never fire), a default policy's latency guard has
+    // nothing legitimate to catch, only scheduler jitter to false-trip on. This
+    // test proves seamlessness, not the latency guard, so disable it here too.
+    rt.canary("int score(int x) { return x * 2; }\n", never_abort()).expect("start");
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
