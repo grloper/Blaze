@@ -29,8 +29,8 @@ use std::sync::Arc;
 
 use blaze_parse::ast::{BinOp, Block, CallExpr, ElseArm, Expr, Function, SourceFile, Stmt};
 
-use crate::db::{BlazeDatabase, FnKey, SourceProgram};
-use crate::ir::{function_id_of, CmpKind, FunctionNode, IrBuilder, Signature, Type};
+use crate::db::{function_id, BlazeDatabase, FnKey, SourceProgram};
+use crate::ir::{CmpKind, FunctionNode, IrBuilder, Signature, Type};
 
 /// The lossless green tree of the whole file — parsed **once per revision**.
 ///
@@ -114,7 +114,7 @@ pub fn lowered_dev_ir<'db>(
 
     let text = function_text(db, src, key);
     let Some(func) = parse_single(text) else {
-        return Arc::new(FunctionNode::empty(function_id_of(name)));
+        return Arc::new(FunctionNode::empty(function_id(db, name)));
     };
     let signature = function_signature(db, src, key);
     let node = Lowerer { db, src }.lower_function(&func, name, signature);
@@ -155,7 +155,7 @@ impl<'db> Lowerer<'db> {
             builder.ret(zero);
         }
 
-        builder.finish(function_id_of(name), signature)
+        builder.finish(function_id(self.db, name), signature)
     }
 
     /// Lower every statement of `block`. Returns `true` if the block
@@ -343,7 +343,7 @@ impl<'db> Lowerer<'db> {
 
     fn lower_call(&self, b: &mut IrBuilder, env: &mut HashMap<String, u32>, call: &CallExpr) -> u32 {
         let callee_name = call.callee().unwrap_or_default();
-        let callee_id = function_id_of(&callee_name);
+        let callee_id = function_id(self.db, &callee_name);
 
         // THE FIREWALL EDGE: reading the callee's *signature* (not its body)
         // creates a salsa dependency that backdates whenever the callee's ABI is

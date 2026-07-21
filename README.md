@@ -234,6 +234,12 @@ state.
 - **Modern salsa.** Blaze targets salsa 0.28 (`#[salsa::tracked]` functions
   over a `#[salsa::db]` trait) — the maintained API that rust-analyzer uses,
   not the long-removed `query_group` macros.
+- **Function identity is interned, not hashed.** A function's id is salsa's
+  interned id for its name — an injective map — so two distinct names can never
+  collide onto one id and route a call to the wrong function. Proven over 5000
+  names in `blaze-ir` (`function_ids_are_idempotent_and_collision_free`). Ids
+  are consistent for the life of one runtime, the only scope they're compared
+  in.
 - **Generations are retired, not freed.** Deliberate: soundness under
   concurrent callers first; the leak is bounded by edit count × edited-function
   size, negligible for a dev loop.

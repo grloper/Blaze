@@ -9,6 +9,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::ir::FunctionId;
+
 /// The whole-file source input — the coarse "raw source" the frontend feeds in.
 ///
 /// Fine-grained, per-function incrementality is *derived* from this single input
@@ -29,6 +31,18 @@ pub struct SourceProgram {
 pub struct FnKey<'db> {
     #[returns(ref)]
     pub name: String,
+}
+
+/// The stable [`FunctionId`] for `name` within `db`.
+///
+/// This is `salsa`'s interned id for the name — an injective map, so two
+/// distinct names can never collide onto the same id (the guarantee a name
+/// hash could not make). Ids are consistent for the life of one database (one
+/// runtime), which is the only scope in which they are ever compared. Interning
+/// inside a tracked query is dependency-free and does not perturb the firewall.
+pub fn function_id(db: &dyn BlazeDatabase, name: &str) -> FunctionId {
+    use salsa::plumbing::AsId;
+    FunctionId(FnKey::new(db, name.to_string()).as_id().index())
 }
 
 /// Native functions the embedding host has registered, by name → arity.
@@ -124,5 +138,30 @@ impl BlazeDatabaseImpl {
     pub fn enable_tracing(&self) -> ExecTrace {
         self.trace.enable();
         self.trace.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn function_ids_are_idempotent_and_collision_free() {
+        let db = BlazeDatabaseImpl::default();
+
+        // Idempotent: the same name always maps to the same id.
+        assert_eq!(function_id(&db, "score"), function_id(&db, "score"));
+
+        // Injective: across a large batch of distinct names — including ones a
+        // 32-bit hash might have aliased — every id is unique. This is the
+        // guarantee interning makes that a hash cannot.
+        let names: Vec<String> = (0..5000).map(|i| format!("fn_{i}")).collect();
+        let ids: HashSet<u32> = names.iter().map(|n| function_id(&db, n).0).collect();
+        assert_eq!(ids.len(), names.len(), "every distinct name must get a distinct id");
+
+        // Distinct names are distinct ids; re-querying is stable.
+        assert_ne!(function_id(&db, "a"), function_id(&db, "b"));
+        assert_eq!(function_id(&db, "a"), function_id(&db, "a"));
     }
 }
