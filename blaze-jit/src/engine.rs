@@ -8,14 +8,15 @@
 
 use std::collections::HashMap;
 
-use cranelift_codegen::ir::{types, AbiParam, InstBuilder, UserFuncName};
+use cranelift_codegen::ir::{InstBuilder, UserFuncName, Value};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, FuncId, Linkage, Module};
 
 use blaze_ir::{FunctionId, FunctionNode};
 
-use crate::codegen::{build_body, host_isa, CallEmitter};
+use crate::abi::{self, CallState, MAX_ARITY};
+use crate::codegen::{build_body, clif_signature, host_isa, CallEmitter, DEFAULT_MAX_DEPTH};
 
 /// Emits direct calls against functions already declared in the module.
 struct ModuleEmitter<'a> {
@@ -27,15 +28,20 @@ impl CallEmitter for ModuleEmitter<'_> {
     fn emit_call(
         &mut self,
         builder: &mut FunctionBuilder,
+        ctx: Value,
         callee: FunctionId,
-        args: &[cranelift_codegen::ir::Value],
-    ) -> cranelift_codegen::ir::Value {
+        args: &[Value],
+    ) -> Value {
         let func_id = *self
             .ids
             .get(&callee)
             .expect("every called function must be declared before definition");
         let callee_ref = self.module.declare_func_in_func(func_id, builder.func);
-        let call = builder.ins().call(callee_ref, args);
+        // Thread the context pointer as the callee's hidden leading argument.
+        let mut call_args = Vec::with_capacity(args.len() + 1);
+        call_args.push(ctx);
+        call_args.extend_from_slice(args);
+        let call = builder.ins().call(callee_ref, &call_args);
         builder.inst_results(call)[0]
     }
 }
@@ -62,13 +68,11 @@ impl JitEngine {
     /// name with its lowered DevIR node. After this returns, [`Self::call`] can
     /// invoke any of them.
     pub fn compile(&mut self, funcs: &[(String, FunctionNode)]) -> Result<(), String> {
+        let call_conv = self.module.target_config().default_call_conv;
+
         // Pass 1 — declare every function so intra-program calls can be linked.
         for (name, node) in funcs {
-            let mut sig = self.module.make_signature();
-            for _ in 0..node.signature.arity() {
-                sig.params.push(AbiParam::new(types::I64));
-            }
-            sig.returns.push(AbiParam::new(types::I64));
+            let sig = clif_signature(node.signature.arity(), call_conv);
             let func_id = self
                 .module
                 .declare_function(name, Linkage::Export, &sig)
@@ -83,21 +87,14 @@ impl JitEngine {
             let frontend_cfg = self.module.target_config();
 
             let mut ctx = self.module.make_context();
-            ctx.func.signature = {
-                let mut sig = self.module.make_signature();
-                for _ in 0..node.signature.arity() {
-                    sig.params.push(AbiParam::new(types::I64));
-                }
-                sig.returns.push(AbiParam::new(types::I64));
-                sig
-            };
+            ctx.func.signature = clif_signature(node.signature.arity(), call_conv);
             ctx.func.name = UserFuncName::user(0, func_id.as_u32());
 
             let mut fb_ctx = FunctionBuilderContext::new();
             {
                 let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fb_ctx);
                 let mut emitter = ModuleEmitter { module: &mut self.module, ids: &self.ids };
-                build_body(&mut builder, node, &mut emitter);
+                build_body(&mut builder, node, DEFAULT_MAX_DEPTH, &mut emitter);
                 builder.finalize(frontend_cfg);
             }
 
@@ -114,36 +111,32 @@ impl JitEngine {
         Ok(())
     }
 
-    /// Invoke a compiled function by name. Supports arities 0..=4 (sufficient
-    /// for the C-subset); returns `None` for unknown names or higher arities.
+    /// Invoke a compiled function by name. Supports arities 0..=[`MAX_ARITY`];
+    /// returns `None` for unknown names or higher arities.
+    ///
+    /// This is the simple, non-live engine: it runs each call with a fresh
+    /// [`CallState`] (so recursion is still depth-guarded and cannot fault the
+    /// host) but does not surface resource-limit traps as typed errors — that
+    /// is [`crate::LiveRuntime`]'s job. A trapped call here simply yields a
+    /// defined (meaningless) value rather than crashing.
     ///
     /// # Safety
     ///
     /// Internally transmutes the finalized code pointer to a C ABI function.
     /// This is sound because every Blaze function is compiled with the
-    /// `(i64, …) -> i64` signature this dispatches on.
+    /// context-threading `(*mut CallState, i64…) -> i64` signature
+    /// [`abi::invoke`] dispatches on.
     pub fn call(&self, name: &str, args: &[i64]) -> Option<i64> {
+        if args.len() > MAX_ARITY {
+            return None;
+        }
         let func_id = *self.by_name.get(name)?;
         let code = self.module.get_finalized_function(func_id);
-        // SAFETY: `code` points at finalized, executable code generated with the
-        // matching `(i64 * n) -> i64` signature; arity is checked here.
-        unsafe {
-            let result = match args {
-                [] => std::mem::transmute::<*const u8, extern "C" fn() -> i64>(code)(),
-                [a] => std::mem::transmute::<*const u8, extern "C" fn(i64) -> i64>(code)(*a),
-                [a, b] => {
-                    std::mem::transmute::<*const u8, extern "C" fn(i64, i64) -> i64>(code)(*a, *b)
-                }
-                [a, b, c] => std::mem::transmute::<*const u8, extern "C" fn(i64, i64, i64) -> i64>(
-                    code,
-                )(*a, *b, *c),
-                [a, b, c, d] => std::mem::transmute::<
-                    *const u8,
-                    extern "C" fn(i64, i64, i64, i64) -> i64,
-                >(code)(*a, *b, *c, *d),
-                _ => return None,
-            };
-            Some(result)
-        }
+        // Fuel disabled (u64::MAX); the depth guard still applies.
+        let mut state = CallState::new(u64::MAX);
+        // SAFETY: `code` points at finalized code generated with the matching
+        // context-threading signature; arity is bounds-checked above.
+        let result = unsafe { abi::invoke(code, &mut state, args) };
+        Some(result)
     }
 }

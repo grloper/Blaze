@@ -96,13 +96,15 @@ guarantee with a test hammering it from a second thread:
 | A call-site arity mismatch is `Rejected`, not silently tolerated | `live.rs::arity_mismatch_is_rejected` |
 | Deleting a function a caller still uses is `Rejected`, not silently zeroed | `live.rs::removing_a_used_function_is_rejected_and_holds_last_good` — both functions keep working exactly as before |
 | A defective *first* program fails construction, not silent misbehavior | `live.rs::initial_load_with_a_defect_fails_construction` |
+| Unbounded recursion aborts the *call*, never faults the host | `live.rs::unbounded_recursion_aborts_with_error_not_a_crash` — `spin` recurses forever; every call returns `Err(ResourceExhausted)` and interleaved healthy calls stay exact, under a concurrent bystander |
+| The depth guard doesn't false-positive on real recursion | `live.rs::deep_but_bounded_recursion_succeeds` (100-deep succeeds, past-limit aborts) + `mutual_recursion_is_also_bounded` + `depth_limit_is_configurable` |
 | A live-edited `x / 0` cannot fault the host | `jit.rs::division_is_guarded_and_cannot_fault_the_process` — division is guarded in codegen; `x/0 == 0`, `INT_MIN / -1 == INT_MIN` |
 | The firewall itself | `blaze-ir/tests/incremental.rs` — body edits re-lower one function while callers are byte-for-byte memo hits (`Arc::ptr_eq`); ABI edits cascade |
 
 Run everything:
 
 ```sh
-cargo test --workspace                                  # 44 tests
+cargo test --workspace                                  # 49 tests
 cargo run -p blaze-jit --example live -- --script        # scripted demo of all 3 apply-classes
 cargo run -p blaze-jit --release --example bench_reload  # latency numbers on your machine
 ```
@@ -160,14 +162,15 @@ or table-indirect).
 
 **The language.** A deliberately small C-subset, JIT-compiled to native code:
 `int` (i64) functions, parameters, locals, assignment, `+ - * /`, comparisons,
-`if / else if / else`, `while`, recursion, calls, unary minus. Division is
-guarded by definition of the language — a saved typo cannot fault your process.
-Every call site is validated against a known callee (Blaze-defined or
-host-registered) with a matching argument count *before* a reload is ever
-committed — see `Rejected` above; the slot table's missing-function stub is
-kept only as defense-in-depth, unreachable through the public API in practice.
-Growing the surface (floats, more types, richer state) is roadmap, not
-architecture: the reload guarantees don't change as the language grows.
+`if / else if / else`, `while`, recursion, calls, unary minus. Nothing a script
+can express — not a saved typo, not a divide-by-zero, not runaway recursion —
+can fault the process embedding it: division is guarded (`x/0 == 0`), every
+call site is validated against a known callee with matching arity before a
+reload commits (see `Rejected`), and every function threads a per-call context
+whose depth counter aborts runaway recursion as a typed error rather than a
+stack overflow. Growing the surface (floats, more types, richer state) is
+roadmap, not architecture: the reload and safety guarantees don't change as the
+language grows.
 
 ## Benchmarks
 
@@ -201,9 +204,13 @@ state.
   and undefined variables are proven from the query graph and refused *before*
   touching a live process — a bad save holds the last-good generation open
   rather than hot-swapping mangled semantics in
+- ✅ **Depth guard**: every function threads a per-call context (wasmtime's
+  `vmctx` pattern) carrying a call-depth counter; a prologue that would exceed
+  the limit aborts the *call* with `Err(ResourceExhausted)` instead of blowing
+  the native stack. Runaway recursion can no longer fault the host
 - ✅ Terminal live demo + scripted CI-safe mode + latency benchmark
-- 🔜 Stack-depth and fuel (CPU-time) limits, so unbounded recursion and
-  runaway loops fail a *call* with a defined error instead of risking the host
+- 🔜 Fuel (CPU-time) metering on the same context, so runaway loops
+  (`while(1){}`) fail a *call* with a defined error too (H3)
 - 🔜 In-process canary: mirror live traffic through a candidate generation
   before promoting it, with an auto-abort policy
 - 🔜 Generation journal + `rollback()`: every reload's source, class, and

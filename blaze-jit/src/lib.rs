@@ -12,6 +12,7 @@
 //! because [`compiled_machine_code`] depends only on `lowered_dev_ir`, editing a
 //! callee's body recompiles that callee's code while callers stay memoized.
 
+pub mod abi;
 pub mod codegen;
 pub mod engine;
 pub mod live;
