@@ -218,7 +218,13 @@ fn a_matching_candidate_promotes_through_the_swap_protocol() {
 fn promote_is_seamless_under_concurrent_traffic() {
     let rt = Arc::new(LiveRuntime::new("int score(int x) { return x + x; }\n").expect("compile"));
     // Equivalent candidate, so the answer is 10 before *and* after promotion.
-    rt.canary("int score(int x) { return x * 2; }\n", CanaryPolicy::default()).expect("start");
+    // The worker below hammers call_canary at 100% sampling for the run's
+    // duration — easily enough calls to cross the default latency-check floor
+    // under real contention, and since x*2/x+x are equal-cost single-instruction
+    // ops (divergence can never fire), a default policy's latency guard has
+    // nothing legitimate to catch, only scheduler jitter to false-trip on. This
+    // test proves seamlessness, not the latency guard, so disable it here too.
+    rt.canary("int score(int x) { return x * 2; }\n", never_abort()).expect("start");
 
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
