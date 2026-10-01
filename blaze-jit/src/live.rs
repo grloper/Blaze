@@ -1,7 +1,7 @@
 //! The **live-swap runtime**: hot reload that is correct by construction.
 //!
 //! Every call between Blaze functions is compiled as an indirect call through a
-//! process-stable **slot table** (one `mmap`'d atomic pointer per function).
+//! process-stable **slot table** (one heap-allocated atomic pointer per function).
 //! Reloading therefore never rewrites existing code — it compiles the changed
 //! functions into a fresh generation of executable pages and atomically
 //! repoints their slots.
@@ -71,7 +71,7 @@ extern "C" fn missing_stub(_ctx: *mut CallState) -> i64 {
 /// whose slot becomes empty always detects it.
 const ARITY_EMPTY: u64 = u64::MAX;
 
-/// A page-aligned, `mmap`-allocated array of atomic function-pointer slots,
+/// A fixed heap allocation of atomic function-pointer slots,
 /// with a parallel array of the arity currently compiled into each slot.
 ///
 /// The *code* array's address is stable for the life of the runtime — generated
@@ -85,37 +85,20 @@ const ARITY_EMPTY: u64 = u64::MAX;
 /// double-checks arity around the code load can never call code with a
 /// mismatched argument count.
 struct SwapTable {
-    code: *mut AtomicU64,
-    bytes: usize,
+    code: Box<[AtomicU64]>,
     /// Arity compiled into each slot, or [`ARITY_EMPTY`]. Boxed (not `mmap`'d):
     /// only the runtime touches it, never generated code.
     arity: Box<[AtomicU64]>,
 }
 
-// SAFETY: the table is a fixed allocation of atomics; all mutation goes through
-// atomic operations.
-unsafe impl Send for SwapTable {}
-unsafe impl Sync for SwapTable {}
-
 impl SwapTable {
     fn new() -> Result<Self, String> {
-        let bytes = TABLE_CAPACITY * std::mem::size_of::<AtomicU64>();
-        // SAFETY: anonymous private mapping, checked for MAP_FAILED below.
-        let code = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                bytes,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if code == libc::MAP_FAILED {
-            return Err("mmap of the swap table failed".to_string());
-        }
+        // These slots contain data pointers, not executable code. A boxed slice
+        // supplies AtomicU64 alignment and stable addresses on all platforms;
+        // moving SwapTable never moves the allocation baked into JIT calls.
+        let code = (0..TABLE_CAPACITY).map(|_| AtomicU64::new(0)).collect();
         let arity = (0..TABLE_CAPACITY).map(|_| AtomicU64::new(ARITY_EMPTY)).collect();
-        let table = SwapTable { code: code.cast::<AtomicU64>(), bytes, arity };
+        let table = SwapTable { code, arity };
         // Every slot starts as the missing stub, so even a call emitted against
         // a never-defined function lands somewhere harmless.
         for i in 0..TABLE_CAPACITY {
@@ -126,10 +109,7 @@ impl SwapTable {
 
     #[inline]
     fn code(&self, index: usize) -> &AtomicU64 {
-        assert!(index < TABLE_CAPACITY);
-        // SAFETY: `code` points at TABLE_CAPACITY zero-initialized AtomicU64s,
-        // properly aligned by mmap's page alignment; index is bounds-checked.
-        unsafe { &*self.code.add(index) }
+        &self.code[index]
     }
 
     #[inline]
@@ -141,7 +121,7 @@ impl SwapTable {
     #[inline]
     fn code_addr(&self, index: usize) -> usize {
         assert!(index < TABLE_CAPACITY);
-        self.code as usize + index * std::mem::size_of::<AtomicU64>()
+        self.code.as_ptr() as usize + index * std::mem::size_of::<AtomicU64>()
     }
 
     /// Publish a function into a slot: store its arity *before* its code
@@ -160,13 +140,6 @@ impl SwapTable {
         self.arity(index).store(ARITY_EMPTY, Ordering::Release);
         self.code(index)
             .store(missing_stub as extern "C" fn(*mut CallState) -> i64 as usize as u64, Ordering::Release);
-    }
-}
-
-impl Drop for SwapTable {
-    fn drop(&mut self) {
-        // SAFETY: unmapping exactly the region mapped in `new`.
-        unsafe { libc::munmap(self.code.cast(), self.bytes) };
     }
 }
 
@@ -1291,7 +1264,7 @@ impl LiveRuntime {
         let rate = self.canary_rate.load(Ordering::Relaxed);
         let sampling = rate != 0 && {
             let n = self.canary_counter.fetch_add(1, Ordering::Relaxed);
-            n % rate == 0
+            n.is_multiple_of(rate)
         };
         let primary_start = if sampling { Some(Instant::now()) } else { None };
         let primary = self.call(name, args);
