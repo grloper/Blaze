@@ -19,4 +19,11 @@ jobs:
           components: clippy
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo run -p blaze-jit --example living_service --locked -- --script
+      - name: Run bounded scripted native workflow
+        timeout-minutes: 5
+        run: cargo run -p blaze-jit --example living_service --locked -- --script > living-service.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: living-service-${{ matrix.os }}
+          path: living-service.log
