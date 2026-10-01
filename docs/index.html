@@ -4,19 +4,19 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Blaze — the live logic runtime</title>
-<meta name="description" content="Blaze hot-swaps functions in a running production process in ~500 microseconds — provably safe, canaried against live traffic, instantly reversible. For humans and for AI agents." />
+<meta name="description" content="Blaze is an experimental Rust JIT for live function edits, canary evaluation and rollback. Exercised by 110 tests and a six-stage local HTTP demo." />
 <meta name="theme-color" content="#0a0b0d" />
 <meta name="color-scheme" content="dark" />
 
 <!-- Open Graph / Twitter -->
 <meta property="og:type" content="website" />
 <meta property="og:title" content="Blaze — the live logic runtime" />
-<meta property="og:description" content="Swap functions in a running process in ~500µs — with a proof, a canary, and an undo button. And it is how you let an AI touch production logic without fear." />
+<meta property="og:description" content="Explore live function edits, canary evaluation and rollback in a tested Rust JIT prototype. Local evidence, not a production guarantee." />
 <meta property="og:url" content="https://grloper.github.io/Blaze/" />
 <meta property="og:site_name" content="Blaze" />
 <meta name="twitter:card" content="summary" />
 <meta name="twitter:title" content="Blaze — the live logic runtime" />
-<meta name="twitter:description" content="Swap functions in a running process in ~500µs — provably safe, canaried against live traffic, instantly reversible. For humans and for AI agents." />
+<meta name="twitter:description" content="Live function edits, canaries and rollback in an experimental Rust JIT. 110 tests and a six-stage local demonstration." />
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2024%2024'%3E%3Cpath%20fill='%23ff6b35'%20d='M12%202c3%204%201%206-1%208.5C9.4%2012.4%208%2014%208%2016a4%204%200%200%200%208%200c0-1-.3-2-.8-2.8%201.6.7%202.8%202.4%202.8%204.8a6%206%200%201%201-12%200c0-3%202-5%203.5-7C11%208%2012.5%205%2012%202Z'/%3E%3C/svg%3E" />
 
@@ -515,11 +515,11 @@
     <div class="wrap">
       <span class="pill"><span class="dot"></span> Sound hot reload · JIT-native · Apache-2.0</span>
       <h1 id="hero-h1">The live logic runtime.</h1>
-      <p class="tagline">Swap a <span class="accent">function</span> in a running production process — in ~500&nbsp;microseconds.</p>
-      <p class="subtag">Provably safe. Canaried against live traffic. Instantly reversible. An embeddable JIT scripting runtime — for humans, and for AI agents.</p>
+      <p class="tagline">Swap a <span class="accent">function</span> in a running local service.</p>
+      <p class="subtag">Classify the edit. Evaluate a canary. Return to an earlier generation. An experimental embeddable JIT scripting runtime, exercised under concurrent local load.</p>
 
       <blockquote class="quote">
-        “LaunchDarkly flips booleans. <b>Blaze swaps functions</b> — in 500&nbsp;microseconds, with a proof, a canary, and an undo button. And it is how you let an AI touch production logic without fear.”
+        “<b>Blaze swaps functions</b> through stable call slots. The local demo makes rejection, canary failure, promotion, relinking and rollback visible.”
       </blockquote>
 
       <div class="cta-row">
@@ -532,26 +532,14 @@
             <span class="copy-label">Copy</span>
           </button>
         </div>
-        <a class="btn btn-ghost" href="#proofs">Read the proofs →</a>
+        <a class="btn btn-ghost" href="#proofs">Read the test evidence →</a>
       </div>
 
-      <div class="stats" aria-label="Key measured numbers">
-        <div class="stat">
-          <div class="num" data-count="496" data-suffix="µs">496µs</div>
-          <div class="lbl">body-edit hot-swap under live HTTP load</div>
-        </div>
-        <div class="stat">
-          <div class="num" data-count="51815" data-comma>51,815</div>
-          <div class="lbl">requests across 6 live edits · 0 dropped</div>
-        </div>
-        <div class="stat">
-          <div class="num" data-count="51" data-suffix="×">51×</div>
-          <div class="lbl">faster than an embedded interpreter, same rule</div>
-        </div>
-        <div class="stat">
-          <div class="num" data-count="110">110</div>
-          <div class="lbl">tests, each attacking a claim from a 2nd thread</div>
-        </div>
+      <div class="stats" aria-label="Bounded verification scope">
+        <div class="stat"><div class="num">110</div><div class="lbl">tests passed per Windows/Linux CI suite</div></div>
+        <div class="stat"><div class="num">6</div><div class="lbl">native local edit scenarios exercised</div></div>
+        <div class="stat"><div class="num">2</div><div class="lbl">Windows audit demo runs completed</div></div>
+        <div class="stat"><div class="num">Local</div><div class="lbl">loopback workload; no production claim</div></div>
       </div>
     </div>
   </section>
@@ -561,11 +549,11 @@
     <div class="wrap">
       <div class="section-head">
         <p class="eyebrow">See it run</p>
-        <h2 id="demo-h">A living service under fire.</h2>
-        <p class="lede">An HTTP risk-scoring service whose logic is a <code class="prose">.blaze</code> program, hot-swapped while thousands of requests per second pour through it. Six live edits — every beat asserted, over real HTTP, under load.</p>
+        <h2 id="demo-h">Six edits. One local service.</h2>
+        <p class="lede">An ephemeral loopback HTTP risk-scoring service whose logic is a <code class="prose">.blaze</code> program. The native scripted demo exercises six edit scenarios under concurrent local load. It is not a production deployment.</p>
       </div>
 
-      <div class="term-shell" role="img" aria-label="Scripted living-service run: six live edits classified as SafeSwap, Rejected, canary-caught runaway, canary promote, Relink, and rollback — 51,815 requests served across 6 live edits, 0 dropped, all six guarantees asserted.">
+      <div class="term-shell" role="img" aria-label="Scripted living-service run: six live edits classified as SafeSwap, Rejected, canary-caught runaway, canary promote, Relink, and rollback — an illustrative summary of the six scenarios completed in local audit runs.">
         <div class="term-bar">
           <span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
           <span class="ttl">living_service — scripted run under load</span>
@@ -573,13 +561,13 @@
         <div class="term-body" id="term-body">
           <div class="term-line cmdline" data-line><span class="p">$ </span>cargo run -p blaze-jit --release --example living_service -- --script</div>
           <div class="term-line banner" data-line>━━━ Blaze living-service — scripted run under load ━━━</div>
-          <div class="term-line served" data-line>served <b>51,815</b> requests across 6 live edits, <span style="color:var(--green)">0 dropped</span></div>
+          <div class="term-line served" data-line>exercised <b>6</b> local edit scenarios, <span style="color:var(--green)">0 dropped</span></div>
           <div class="term-line" data-line>&nbsp;</div>
 
           <div class="term-line beat" data-line>
             <span class="idx">[1]</span><span class="act">body edit →</span>
             <span class="detail"><span class="badge safeswap">SafeSwap</span> &nbsp;radius {velocity_risk}</span>
-            <span class="metric">496µs &nbsp; <span class="drop0">dropped 0</span></span>
+            <span class="metric">host-dependent &nbsp; <span class="drop0">dropped 0</span></span>
           </div>
           <div class="term-line beat" data-line>
             <span class="idx">[2]</span><span class="act">broken save →</span>
@@ -593,29 +581,29 @@
           </div>
           <div class="term-line beat" data-line>
             <span class="idx">[4]</span><span class="act">risky rule →</span>
-            <span class="detail"><span class="badge canary">canary</span> &nbsp;saw 309 divergences; promoted as SafeSwap</span>
+            <span class="detail"><span class="badge canary">canary</span> &nbsp;observed divergences; promoted as SafeSwap</span>
             <span class="metric"><span class="drop0">dropped 0</span></span>
           </div>
           <div class="term-line beat" data-line>
             <span class="idx">[5]</span><span class="act">ABI change →</span>
             <span class="detail"><span class="badge relink">Relink</span> &nbsp;radius {velocity_risk, score}</span>
-            <span class="metric">1.08ms &nbsp; <span class="drop0">dropped 0</span></span>
+            <span class="metric">host-dependent &nbsp; <span class="drop0">dropped 0</span></span>
           </div>
           <div class="term-line beat" data-line>
             <span class="idx">[6]</span><span class="act">rollback to gen 1 →</span>
             <span class="detail"><span class="badge relink">Relink</span> &nbsp;values exact</span>
-            <span class="metric">1.28ms &nbsp; <span class="drop0">dropped 0</span></span>
+            <span class="metric">host-dependent &nbsp; <span class="drop0">dropped 0</span></span>
           </div>
 
           <div class="term-line" data-line>&nbsp;</div>
-          <div class="term-line muted" data-line>steady-state scoring latency: p50 64ns, p99 512ns</div>
+          <div class="term-line muted" data-line>latency: measure on your host; no fixed latency guarantee</div>
           <div class="term-line term-foot" data-line>
-            <span>served <span class="served">51,815</span> requests across 6 live edits, 0 dropped</span>
-            <span class="ok">all six guarantees asserted ✓<span class="term-cursor" aria-hidden="true"></span></span>
+            <span>six local scenarios; assertions passed in audit runs</span>
+            <span class="ok">all six scenario assertions passed ✓<span class="term-cursor" aria-hidden="true"></span></span>
           </div>
         </div>
       </div>
-      <p class="caption">Recorded deterministically from <code class="prose">docs/living_service.tape</code>. Hammered from four threads by <code class="prose">tests/living_service.rs</code>.</p>
+      <p class="caption">Animated summary of the native scripted scenarios, not a live terminal capture. Two Windows audit runs completed all six assertions with zero dropped requests in those runs. Timings and request counts depend on the host; run the command above to measure yours.</p>
     </div>
   </section>
 
@@ -675,23 +663,23 @@
       <div class="cards">
         <div class="card c-rejected">
           <span class="chip">Rejected</span>
-          <h3>A defect is proven — nothing goes live</h3>
+          <h3>Invalid source is rejected</h3>
           <p>Syntax error, undefined callee, arity or type mismatch, undefined variable. <span class="proto">Nothing is compiled or patched;</span> the previous known-good generation keeps serving every call untouched.</p>
         </div>
         <div class="card c-noeffect">
           <span class="chip">NoEffect</span>
           <h3>The edit changed nothing that matters</h3>
-          <p>No function’s IR changed — a comment, whitespace. <span class="proto">Zero codegen, zero generations,</span> and it costs nothing at all.</p>
+          <p>No function’s IR changed — a comment, whitespace. <span class="proto">Zero codegen, zero generations,</span> with parsing and edit-classification work still required.</p>
         </div>
         <div class="card c-safeswap">
           <span class="chip">SafeSwap</span>
           <h3>A body changed, signatures held</h3>
-          <p><span class="proto">One lock-free atomic pointer store</span> — valid under concurrent execution, because the firewall guarantees no caller’s code mentions anything about the callee but its slot.</p>
+          <p><span class="proto">One lock-free atomic pointer store</span> — valid under concurrent execution, with generated callers resolving the callee through its stable slot.</p>
         </div>
         <div class="card c-relink">
           <span class="chip">Relink</span>
           <h3>A signature moved (or a function was removed)</h3>
-          <p>The graph forces every caller in the radius. <span class="proto">The whole proven set recompiles and commits under a quiescence barrier</span> — mismatched caller/callee ABIs are never observable.</p>
+          <p>The graph forces every caller in the radius. <span class="proto">The computed affected set recompiles and commits under a quiescence barrier</span> — mismatched caller/callee ABIs are never observable.</p>
         </div>
       </div>
     </div>
@@ -702,8 +690,8 @@
     <div class="wrap">
       <div class="section-head">
         <p class="eyebrow">The category</p>
-        <h2 id="cat-h">Everything else guesses, flips, or restarts.</h2>
-        <p class="lede">Live behavior change isn’t new — but every existing approach trades away granularity, proof, or speed. Blaze keeps all three.</p>
+        <h2 id="cat-h">Different mechanisms for changing behavior.</h2>
+        <p class="lede">This qualitative comparison explains the intended mechanism. It is not a cross-product benchmark or a claim of universal superiority.</p>
       </div>
 
       <div class="table-wrap">
@@ -714,7 +702,7 @@
               <th scope="col">Unit of change</th>
               <th scope="col">Where it runs</th>
               <th scope="col">Reload speed</th>
-              <th scope="col">Proven radius</th>
+              <th scope="col">Dependency radius</th>
               <th scope="col">Per-rule canary</th>
               <th scope="col">Rollback</th>
             </tr>
@@ -760,7 +748,7 @@
               <td>Blaze</td>
               <td>Individual functions</td>
               <td>In-process JIT</td>
-              <td class="num-cell">~500µs, proven</td>
+              <td class="num-cell">host-dependent</td>
               <td class="yes">✓ per edit</td>
               <td class="yes">✓ live traffic</td>
               <td class="yes">✓ one call</td>
@@ -776,8 +764,8 @@
     <div class="wrap">
       <div class="section-head">
         <p class="eyebrow">For AI agents</p>
-        <h2 id="agent-h">Let an AI touch production logic — without fear.</h2>
-        <p class="lede">The same pipeline that protects a human protects an autonomous editor. Every proposed edit runs a gauntlet before it can reach a real request.</p>
+        <h2 id="agent-h">Exercise an agent-style editing pipeline locally.</h2>
+        <p class="lede">The scripted agent example combines validation, fixture evaluation and canary checks. It does not establish the safety of arbitrary AI-generated changes or a production deployment.</p>
       </div>
 
       <div class="pipeline" role="list" aria-label="Agent edit pipeline">
@@ -809,7 +797,7 @@
     <div class="wrap">
       <div class="section-head">
         <p class="eyebrow">Benchmarks</p>
-        <h2 id="bench-h">Real numbers, honestly labeled.</h2>
+        <h2 id="bench-h">Historical samples. Reproduce on your host.</h2>
       </div>
 
       <div class="machine-caveat">
@@ -857,7 +845,7 @@
             </tbody>
           </table>
         </div>
-        <p class="sub" style="margin-top:14px;margin-bottom:0"><b style="color:var(--ember-2)">~51×</b> the interpreter on identical logic — and still hot-swappable, which a compiled <code class="prose">dylib</code> is not. That is the “swap functions, don’t flip booleans” number.</p>
+        <p class="sub" style="margin-top:14px;margin-bottom:0"><b style="color:var(--ember-2)">~51×</b> the interpreter on identical logic — and still hot-swappable, which a compiled <code class="prose">dylib</code> is not. This historical sample is not a general interpreter comparison.</p>
         <div class="repro">
           <div class="cmd">
             <code><span class="tok-prompt">$ </span>cargo run -p blaze-jit --release --example bench_vs_interpreter</code>
@@ -902,8 +890,8 @@
     <div class="wrap">
       <div class="section-head">
         <p class="eyebrow">Claims → proofs</p>
-        <h2 id="proofs-h">Every claim is a theorem with a test.</h2>
-        <p class="claim-intro">Every <b>“instant”</b>, <b>“safe”</b>, and <b>“proven”</b> on this page traces to a named test that attacks the guarantee <b>from a second thread</b> while it holds. Here are the strongest — each links to its function on GitHub.</p>
+        <h2 id="proofs-h">Implementation claims have executable tests.</h2>
+        <p class="claim-intro">The Windows and Linux CI suites passed 110 tests, including concurrent edit scenarios. These tests provide bounded implementation evidence, not formal proofs or universal reliability guarantees. Links below identify the relevant test functions.</p>
       </div>
 
       <div class="claims">
@@ -956,7 +944,7 @@
           <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/living_service.rs#L76" rel="noopener"><span class="file">living_service.rs</span>::the_living_service_story_holds_under_load <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
         </div>
         <div class="claim">
-          <span class="txt">An autonomous agent’s gate + eval + canary pipeline keeps every bad edit out of production.</span>
+          <span class="txt">The scripted agent fixture rejects its deliberately bad candidate edits.</span>
           <a class="proof" href="https://github.com/grloper/Blaze/blob/main/blaze-jit/tests/agent_loop.rs#L15" rel="noopener"><span class="file">agent_loop.rs</span>::the_agent_pipeline_keeps_every_bad_edit_out_of_production <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M7 17 17 7M9 7h8v8"/></svg></a>
         </div>
       </div>
@@ -969,7 +957,7 @@
       <div class="section-head">
         <p class="eyebrow">Honest limits</p>
         <h2 id="limits-h">A focused core, not a general language.</h2>
-        <p class="lede">What Blaze deliberately does <em>not</em> do yet — so you know before you build on it. None of these change the reload and safety guarantees.</p>
+        <p class="lede">What Blaze deliberately does <em>not</em> do yet — so you know before you build on it. Evaluate these limits before embedding the prototype; the test scenarios do not establish general safety.</p>
       </div>
 
       <div class="limits">
@@ -979,7 +967,7 @@
         </div>
         <div class="limit">
           <h3>Two scalar types only</h3>
-          <p><code>int</code> (i64) and <code>float</code> (f64). No strings, arrays, structs, or pointers — which is also <em>why</em> a script can’t corrupt the host: there are no memory operations to abuse.</p>
+          <p><code>int</code> (i64) and <code>float</code> (f64). No strings, arrays, structs, or pointers — The language exposes no explicit memory operations; that restriction is not an independent security certification of the JIT or host.</p>
         </div>
         <div class="limit">
           <h3>State lives in the host</h3>
