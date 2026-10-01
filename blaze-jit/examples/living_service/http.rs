@@ -146,7 +146,10 @@ pub fn spawn_load(addr: SocketAddr, n: usize, stop: Arc<AtomicBool>) -> Vec<Join
 /// Open one connection and pump requests down it until `stop`, or an IO error
 /// bubbles up (signalling the caller to reconnect).
 fn drive_connection(addr: SocketAddr, stop: &AtomicBool, rng: &mut Rng) -> Result<(), ()> {
-    let stream = TcpStream::connect(addr).map_err(|_| ())?;
+    let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).map_err(|_| ())?;
+    // A stalled peer must not prevent shutdown after the story sets stop.
+    stream.set_read_timeout(Some(Duration::from_secs(2))).map_err(|_| ())?;
+    stream.set_write_timeout(Some(Duration::from_secs(2))).map_err(|_| ())?;
     stream.set_nodelay(true).ok();
     let mut reader = BufReader::new(stream.try_clone().map_err(|_| ())?);
     let mut writer = stream;

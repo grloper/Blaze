@@ -1,0 +1,29 @@
+name: Runtime tests and scripted hot swap
+on:
+  pull_request:
+  push:
+    branches: [main, 'codex/**']
+permissions:
+  contents: read
+jobs:
+  runtime:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.94.0'
+          components: clippy
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run bounded scripted native workflow
+        timeout-minutes: 5
+        run: cargo run -p blaze-jit --example living_service --locked -- --script > living-service.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: living-service-${{ matrix.os }}
+          path: living-service.log
