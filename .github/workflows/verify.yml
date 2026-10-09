@@ -1,0 +1,50 @@
+name: Verify
+
+# Standard verification gate: workflow lint + lint/type check + existing tests.
+# Steps marked continue-on-error fail today for reasons unrelated to this gate.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install actionlint
+        run: python -m pip install actionlint-py==1.7.12.25
+      - name: Lint workflows
+        run: actionlint
+
+  verify:
+    name: lint, type check, tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master branch (toolchain input)
+        with:
+          toolchain: "1.94.0"
+          components: clippy, rustfmt
+
+      - name: rustfmt
+        continue-on-error: true  # non-blocking: fails today for pre-existing reasons
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Tests
+        run: cargo test --workspace --locked
