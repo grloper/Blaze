@@ -40,7 +40,7 @@ proof, never guessed.**
   gate: it re-walks each function with the lowerer's exact statement order and scoping
   and reports every defect the lowerer would otherwise paper over.
 - `blaze-jit` — DevIR → Cranelift (`codegen.rs`) and the live runtime (`live.rs`):
-  - **SwapTable** — an mmap'd array of atomic code pointers at process-stable
+  - **SwapTable** — a fixed boxed allocation of atomic code pointers (not mmap; that was Unix-only) at process-stable
     addresses. Every Blaze→Blaze call compiles to an acquire-load of the callee's slot
     plus an indirect call, so generations never relink and a body swap is one
     release-store.
