@@ -1,0 +1,8 @@
+# Default owner for everything; gate and test paths listed explicitly.
+*                                @grloper
+/.github/                        @grloper
+/scripts/                        @grloper
+/blaze-ir/tests/                 @grloper
+/blaze-jit/tests/                @grloper
+/Cargo.toml                      @grloper
+/AGENTS.md                       @grloper
