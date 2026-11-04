@@ -1,0 +1,17 @@
+# Real output of: cargo run -p blaze-jit --release --example living_service -- --script
+# Rust 1.94.0 (x86_64-pc-windows-gnu), Windows, one local run. Final summary only; the live dashboard repaints are in demo.gif.
+# (Numbers differ from the README's run: that was a different machine and run.)
+
+━━━ Blaze living-service — scripted run under load ━━━
+served 42,834 requests across 6 live edits, 0 dropped
+
+  [1] body edit → SafeSwap, under load              SafeSwap  radius {velocity_risk}  in 336µs   (6,063 reqs, dropped 0)
+  [2] broken save → Rejected, last-good serves on   Rejected  1 diagnostic(s); last-good served on   (6,180 reqs, dropped 0)
+  [3] runaway while(1) → canary traps FuelExhausted  canary trapped FuelExhausted (8 fault(s)); auto-aborted; live untouched   (3,161 reqs, dropped 0)
+  [4] risky rule → canary, divergence report, promote  canary saw 309 divergence(s); promoted as SafeSwap   (12,119 reqs, dropped 0)
+  [5] ABI change → Relink, under load               Relink  radius {velocity_risk, score}  in 991µs   (6,123 reqs, dropped 0)
+  [6] rollback to gen 1, in microseconds            Relink  radius {velocity_risk, age_risk, score}  in 775µs   (6,187 reqs, dropped 0)
+
+steady-state scoring latency: p50 128ns, p99 512ns (in-process compute)
+
+all six guarantees asserted ✓
